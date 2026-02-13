@@ -1,0 +1,1062 @@
+// BufferD - 状态管理（混合方案）
+// iChannel0: BufferD (self)
+// iChannel1: Keyboard
+
+//=============================================================================
+// 数据结构（交互专用）
+//=============================================================================
+
+struct InpState {
+    vec2 mpos;
+    bool mdown;
+    bool mpressed;
+    bool mreleased;
+    bool kshift;
+    bool kalt;
+    bool kctrl;
+};
+
+struct IxResult {
+    uint flags;
+    int targetId;
+    vec3 camPos;
+    vec3 camDir;
+    vec2 angles;
+    vec2 dragAngles;
+    vec2 dragStart;
+    int selId;
+    int actPart;
+    float imode;
+    float transMode;
+    vec3 objPos;
+    vec3 objSiz;
+    vec3 objCol;
+    vec4 objQuat;
+    int addTyp;
+    vec3 addPos;
+    vec3 addSiz;
+    vec3 addCol;
+    vec3 dragVal;
+    vec3 dragPlane;
+    float dragAngle;
+    vec4 dragQuat;
+    vec3 hsv;
+    vec2 pickerPos;
+    vec2 pickerDrag;
+    vec3 undoPos;
+    vec3 undoSiz;
+    vec4 undoQuat;
+    int clipTyp;
+    vec3 clipPos;
+    vec3 clipSiz;
+    vec3 clipCol;
+    vec4 clipQuat;
+    int lastClick;
+    float clickTime;
+};
+
+//=============================================================================
+// 输入收集
+//=============================================================================
+
+InpState gatherInp(vec4 mouse, sampler2D kb, float prevDown) {
+    InpState s;
+    s. mpos = mouse. xy;
+    s.mdown = mouse.z > 0.0;
+    s. mpressed = s.mdown && prevDown < 0.5;
+    s.mreleased = !s.mdown && prevDown > 0.5;
+    s.kshift = keyDown(KEY_SHIFT, kb);
+    s.kalt = keyDown(KEY_ALT, kb);
+    s.kctrl = keyDown(KEY_CTRL, kb);
+    return s;
+}
+
+//=============================================================================
+// 交互结果初始化
+//=============================================================================
+
+IxResult initIxResult() {
+    IxResult r;
+    r.flags = CHG_NONE;
+    r.targetId = -1;
+    r.camPos = vec3(0.0);
+    r.camDir = vec3(0.0);
+    r.angles = vec2(0.0);
+    r.dragAngles = vec2(0.0);
+    r.dragStart = vec2(0.0);
+    r.selId = -1;
+    r.actPart = PART_NONE;
+    r.imode = MODE_NONE;
+    r. transMode = TRANS_TRANSLATE;
+    r. objPos = vec3(0.0);
+    r.objSiz = vec3(0.0);
+    r.objCol = vec3(0.0);
+    r.objQuat = quatId();
+    r.addTyp = OBJ_NONE;
+    r. addPos = vec3(0.0);
+    r.addSiz = vec3(0.0);
+    r.addCol = vec3(0.0);
+    r.dragVal = vec3(0.0);
+    r.dragPlane = vec3(0.0);
+    r.dragAngle = 0.0;
+    r. dragQuat = quatId();
+    r.hsv = vec3(0.0);
+    r.pickerPos = vec2(0.0);
+    r.pickerDrag = vec2(0.0);
+    r.undoPos = vec3(0.0);
+    r.undoSiz = vec3(0.0);
+    r.undoQuat = quatId();
+    r.clipTyp = OBJ_NONE;
+    r. clipPos = vec3(0.0);
+    r.clipSiz = vec3(0.0);
+    r.clipCol = vec3(0.0);
+    r.clipQuat = quatId();
+    r.lastClick = ACT_NONE;
+    r.clickTime = 0.0;
+    return r;
+}
+
+//=============================================================================
+// 分层交互处理
+//=============================================================================
+
+bool procPickerInp(InpState inp, vec2 res, int selId, float md, sampler2D buf, inout IxResult r) {
+    if (selId < 0) return false;
+
+    vec2 pickerPos = ld(buf, 1, ROW_PICKER).xy;
+    vec3 curHSV = ld(buf, 0, ROW_PICKER).xyz;
+
+    if (md == MODE_PICKER_SV || md == MODE_PICKER_H) {
+        if (inp.mdown) {
+            r. flags = r.flags | CHG_PICKER | CHG_OBJECT;
+            r. hsv = getPickerHSV(inp.mpos, pickerPos, curHSV, md);
+            r.pickerPos = pickerPos;
+            r.targetId = selId;
+
+            vec4 od1 = ld(buf, selId * 2 + 1, ROW_OBJECTS);
+            vec4 od2 = ld(buf, selId * 2 + 2, ROW_OBJECTS);
+            r.objPos = od1.yzw;
+            r.objSiz = od2.xyz;
+            r.objCol = hsv2rgb(r.hsv);
+            r.objQuat = ld(buf, selId, ROW_ROTATIONS);
+            return true;
+        }
+        return false;
+    }
+
+    if (md == MODE_PICKER_DRAG) {
+        if (inp.mdown) {
+            vec4 pd = ld(buf, 1, ROW_PICKER);
+            vec2 ds = pd.zw;
+            vec2 np = inp.mpos - ds;
+            float tw = PICKER_SV_SIZE + PICKER_GAP + PICKER_H_WIDTH;
+            np.x = clamp(np.x, 10.0, res. x - tw - 10.0);
+            np.y = clamp(np.y, 10.0, res. y - PICKER_SV_SIZE - PICKER_TITLE_H - 10.0);
+
+            r.flags = r.flags | CHG_PICKER;
+            r.hsv = curHSV;
+            r.pickerPos = np;
+            return true;
+        }
+        return false;
+    }
+
+    if (inp.mpressed) {
+        int hit = checkPickerClick(inp.mpos, pickerPos);
+        if (hit == 1) {
+            r.flags = r. flags | CHG_SELECTION;
+            r. selId = selId;
+            r. imode = MODE_PICKER_SV;
+            r.transMode = ld(buf, 0, ROW_SELECT).z;
+            r.actPart = int(ld(buf, 0, ROW_SELECT).w);
+            return true;
+        }
+        if (hit == 2) {
+            r.flags = r. flags | CHG_SELECTION;
+            r.selId = selId;
+            r.imode = MODE_PICKER_H;
+            r. transMode = ld(buf, 0, ROW_SELECT).z;
+            r.actPart = int(ld(buf, 0, ROW_SELECT).w);
+            return true;
+        }
+        if (hit == 3) {
+            r.flags = r.flags | CHG_SELECTION | CHG_PICKER;
+            r. selId = selId;
+            r.  imode = MODE_PICKER_DRAG;
+            r.transMode = ld(buf, 0, ROW_SELECT).z;
+            r.actPart = int(ld(buf, 0, ROW_SELECT).w);
+            r.hsv = curHSV;
+            r.pickerPos = pickerPos;
+            r.pickerDrag = inp.mpos - pickerPos;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool procUIInp(InpState inp, vec2 res, int selId, float transMode, vec3 camPos, vec3 camDir, int frame, sampler2D buf, inout IxResult r) {
+    if (! inp.mpressed) return false;
+
+    int act = checkUIClick(inp.mpos, res, transMode, selId >= 0);
+    if (act == ACT_NONE) return false;
+
+    float curTime = float(frame) / 60.0;
+    int cnt = getObjCount(buf);
+
+    if (act == ACT_TRANSLATE || act == ACT_ROTATE || act == ACT_SCALE) {
+        r.flags = r. flags | CHG_SELECTION | CHG_UI;
+        r. selId = selId;
+        r. imode = ld(buf, 0, ROW_SELECT).y;
+        r. transMode = act == ACT_TRANSLATE ?  TRANS_TRANSLATE :  (act == ACT_ROTATE ? TRANS_ROTATE :  TRANS_SCALE);
+        r.actPart = int(ld(buf, 0, ROW_SELECT).w);
+        r.lastClick = act;
+        r. clickTime = curTime;
+        return true;
+    }
+
+    if (act == ACT_FOCUS && selId >= 0 && selId < cnt) {
+        Obj obj = loadObj(buf, selId);
+        vec3 objCenter = obj.pos;
+        float objSize = max(max(obj.siz.x, obj.siz.y), obj.siz.z);
+        if (isLightTyp(obj.typ)) objSize = obj.siz.x;
+        
+        vec3 focusPos = objCenter - normalize(camDir) * (objSize + CAM_FOCUS_DIST);
+        
+        r.flags = r. flags | CHG_CAMERA | CHG_UI;
+        r. camPos = focusPos;
+        r.camDir = camDir;
+        r.angles = ld(buf, 1, ROW_CAMERA).xy;
+        r. dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+        r.dragStart = ld(buf, 0, ROW_CAMERA).xy;
+        r.lastClick = ACT_FOCUS;
+        r. clickTime = curTime;
+        return true;
+    }
+
+    if (act == ACT_DELETE && selId >= 0) {
+        r.flags = r. flags | CHG_DELETE | CHG_SELECTION | CHG_UI;
+        r.targetId = selId;
+        r.selId = ID_NONE;
+        r.imode = MODE_NONE;
+        r. transMode = transMode;
+        r.actPart = PART_NONE;
+        r.lastClick = ACT_DELETE;
+        r. clickTime = curTime;
+        return true;
+    }
+
+    if (act >= ACT_SPHERE && act <= ACT_AREA_LIGHT) {
+        int newId = cnt;
+        for (int i = 0; i < MAX_OBJECTS; i++) {
+            if (int(ld(buf, i * 2 + 1, ROW_OBJECTS).x) == OBJ_NONE) { newId = i; break; }
+        }
+        if (newId >= MAX_OBJECTS) return true;
+
+        vec3 spawnPos = camPos + camDir * 3.0;
+        int objTyp = OBJ_NONE;
+        vec3 objSiz = vec3(0.5);
+        vec3 objCol = randCol(frame + newId);
+
+        if (act == ACT_SPHERE) objTyp = OBJ_SPHERE;
+        else if (act == ACT_BOX) { objTyp = OBJ_BOX; objCol = randCol(frame + newId + 100); }
+        else if (act == ACT_PT_LIGHT) { objTyp = OBJ_POINT_LIGHT; objSiz = vec3(1.0); objCol = vec3(1.0, 0.95, 0.8); }
+        else if (act == ACT_SPOT_LIGHT) { objTyp = OBJ_SPOT_LIGHT; objSiz = vec3(1.2); objCol = vec3(1.0, 0.9, 0.7); }
+        else if (act == ACT_AREA_LIGHT) { objTyp = OBJ_AREA_LIGHT; objSiz = vec3(1.0); objCol = vec3(0.8, 0.9, 1.0); }
+
+        r.flags = r. flags | CHG_ADD | CHG_SELECTION | CHG_PICKER | CHG_UI;
+        r.targetId = newId;
+        r.addTyp = objTyp;
+        r. addPos = spawnPos;
+        r.addSiz = objSiz;
+        r.addCol = objCol;
+
+        r.selId = newId;
+        r.imode = MODE_NONE;
+        r. transMode = transMode;
+        r. actPart = PART_NONE;
+
+        r.hsv = rgb2hsv(objCol);
+        r.pickerPos = ld(buf, 1, ROW_PICKER).xy;
+
+        r.lastClick = act;
+        r. clickTime = curTime;
+        return true;
+    }
+
+    return true;
+}
+
+bool procGizmoInp(InpState inp, vec2 res, int selId, float md, float transMode, int actPart,
+                   vec3 camPos, vec3 camDir, vec2 dragStart, sampler2D buf, inout IxResult r) {
+    if (selId < 0) return false;
+
+    int cnt = getObjCount(buf);
+    if (selId >= cnt) return false;
+
+    Obj obj = loadObj(buf, selId);
+    if (obj.typ == OBJ_NONE) return false;
+
+    float asp = res.x / res. y;
+    float fov = radians(CAM_FOV);
+    float gsc = gizmoScl(obj.pos, camPos);
+    bool objIsLit = isLightTyp(obj.typ);
+
+    if (md == MODE_TRANSFORM) {
+        if (inp.mdown) {
+            Ray curRay = createRay(inp.mpos / res, camPos, camDir, fov, asp);
+            vec2 delta = inp.mpos - dragStart;
+
+            vec3 dVal = ld(buf, 0, ROW_DRAG).xyz;
+            vec3 dPlane = ld(buf, 1, ROW_DRAG).xyz;
+            float dAngle = ld(buf, 2, ROW_DRAG).x;
+            vec4 dQuat = ld(buf, 0, ROW_DRAG_ROT);
+
+            r.flags = r. flags | CHG_OBJECT;
+            r.targetId = selId;
+            r.objCol = obj.col;
+
+            if (transMode == TRANS_TRANSLATE) {
+                vec3 newPos;
+                if (actPart == PART_CENTER || actPart == PART_NONE) {
+                    newPos = dVal + rayPlane(camPos, curRay. rd, dPlane, -camDir) - dPlane;
+                } else {
+                    vec3 ax = axisVec(actPart - PART_X);
+                    Ray startRay = createRay(dragStart / res, camPos, camDir, fov, asp);
+                    newPos = dVal + ax * dot(
+                        projectAxis(curRay, dPlane, ax, camDir) -
+                        projectAxis(startRay, dPlane, ax, camDir), ax);
+                }
+                r.objPos = inp.kctrl ? snap3(newPos, TF_SNAP_TRANS) : newPos;
+                r.objSiz = obj.siz;
+                r.objQuat = obj.quat;
+            }
+            else if (transMode == TRANS_ROTATE) {
+                r.objPos = obj.pos;
+                r.objSiz = obj.siz;
+
+                if (actPart >= PART_X) {
+                    int ax = actPart - PART_X;
+                    float curAng = calcRotAngle(curRay.ro, curRay.rd, obj.pos, axisVec(ax));
+                    float dAng = angleDiff(curAng, dAngle);
+                    if (inp.kctrl) dAng = snap(dAng, TF_SNAP_ROT);
+                    r.objQuat = normalize(quatMul(quatAxis(axisVec(ax), dAng), dQuat));
+                } else {
+                    float rx = delta.y / res.y * PI * TF_ROT_SENS;
+                    float ry = delta. x / res.x * PI * TF_ROT_SENS;
+                    if (inp.kctrl) { rx = snap(rx, TF_SNAP_ROT); ry = snap(ry, TF_SNAP_ROT); }
+                    r.objQuat = applyWorldRot(dQuat, rx, ry, 0.0);
+                }
+            }
+            else if (transMode == TRANS_SCALE) {
+                r.objPos = obj.pos;
+                r. objQuat = obj.quat;
+
+                vec3 newSiz;
+                if (objIsLit || actPart == PART_CENTER) {
+                    newSiz = dVal * (1.0 + delta.y / res. y * TF_SCALE_SENS);
+                } else if (actPart >= PART_X) {
+                    int ax = actPart - PART_X;
+                    float d = (ax == 0) ? -delta.x / res.x * TF_SCALE_SENS : delta.y / res.y * TF_SCALE_SENS;
+                    newSiz = dVal;
+                    newSiz[ax] = dVal[ax] * (1.0 + d);
+                } else {
+                    newSiz = dVal * (1.0 + delta.y / res.y * TF_SCALE_SENS);
+                }
+                r.objSiz = clamp(inp.kctrl ?  snap3(newSiz, TF_SNAP_SCALE) : newSiz, 
+                                 vec3(TF_SCALE_MIN), vec3(TF_SCALE_MAX));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (inp.mpressed && ! inp.kshift && ! inp.kalt) {
+        Ray pickRay = createRay(inp.mpos / res, camPos, camDir, fov, asp);
+
+        GizmoCtx ctx;
+        ctx. center = obj.pos;
+        ctx.camPos = camPos;
+        ctx.transMode = transMode;
+        ctx.actPart = actPart;
+        ctx.quat = obj.quat;
+        ctx.gscale = gsc;
+        ctx. isLit = objIsLit;
+
+        float hitT;
+        int hitPart = pickGizmo(pickRay, ctx, hitT);
+
+        if (hitPart != PART_NONE) {
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG | CHG_UNDO;
+
+            r.selId = selId;
+            r.imode = MODE_TRANSFORM;
+            r. transMode = transMode;
+            r.actPart = hitPart;
+
+            r.dragStart = inp.mpos;
+            r.camPos = camPos;
+            r.camDir = camDir;
+            r.angles = ld(buf, 1, ROW_CAMERA).xy;
+            r. dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+
+            r.dragPlane = obj.pos;
+            r.dragVal = transMode == TRANS_SCALE ? obj.siz : obj.pos;
+            r. dragQuat = obj.quat;
+
+            if (transMode == TRANS_ROTATE && hitPart >= PART_X) {
+                r.dragAngle = calcRotAngle(pickRay.ro, pickRay.rd, obj.pos, axisVec(hitPart - PART_X));
+            }
+
+            r.targetId = selId;
+            r.undoPos = obj.pos;
+            r.undoSiz = obj.siz;
+            r.undoQuat = obj.quat;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool procSceneInp(InpState inp, vec2 res, int selId, float transMode, vec3 camPos, vec3 camDir, sampler2D buf, inout IxResult r) {
+    if (! inp.mpressed) return false;
+    if (inp.kshift || inp.kalt) return false;
+
+    float asp = res.x / res.y;
+    float fov = radians(CAM_FOV);
+    int cnt = getObjCount(buf);
+
+    Ray pickRay = createRay(inp.mpos / res, camPos, camDir, fov, asp);
+    // 使用解析几何进行拾取
+    Hit hit = traceSceneAnalytic(pickRay, buf, cnt, true);
+
+    if (hit. id >= 0) {
+        if (hit.id == selId) {
+            Obj obj = loadObj(buf, selId);
+
+            r.flags = r. flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG | CHG_UNDO;
+
+            r.selId = selId;
+            r.imode = MODE_TRANSFORM;
+            r. transMode = transMode;
+            r. actPart = PART_CENTER;
+
+            r.dragStart = inp.mpos;
+            r. camPos = camPos;
+            r. camDir = camDir;
+            r. angles = ld(buf, 1, ROW_CAMERA).xy;
+            r.dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+
+            r.dragPlane = obj.pos;
+            r.dragVal = transMode == TRANS_SCALE ? obj.siz : obj.pos;
+            r.dragQuat = obj. quat;
+
+            r.targetId = selId;
+            r.undoPos = obj.pos;
+            r.undoSiz = obj. siz;
+            r.undoQuat = obj.quat;
+        } else {
+            Obj obj = loadObj(buf, hit. id);
+
+            r.flags = r.flags | CHG_SELECTION | CHG_PICKER;
+            r.selId = hit.id;
+            r.imode = MODE_NONE;
+            r. transMode = transMode;
+            r. actPart = PART_NONE;
+
+            r.hsv = rgb2hsv(obj.col);
+            r.pickerPos = ld(buf, 1, ROW_PICKER).xy;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void procCameraInp(InpState inp, vec2 res, int selId, float md, vec2 angles, vec2 dragAngles, vec2 dragStart,
+                    vec3 camPos, vec3 camDir, sampler2D kb, sampler2D buf, inout IxResult r) {
+
+    if (md == MODE_CAMERA) {
+        if (inp.mdown) {
+            vec2 delta = inp.mpos - dragStart;
+            vec2 newAng;
+            newAng. y = dragAngles.y - delta.x / res.x * CAM_SENS_X;
+            newAng.x = clamp(dragAngles.x + delta.y / res. y * CAM_SENS_Y, -1.5, 1.5);
+
+            r.flags = r. flags | CHG_CAMERA;
+            r.angles = newAng;
+            r.camDir = angles2dir(newAng);
+            r.camPos = camPos;
+            r.dragStart = dragStart;
+            r.dragAngles = dragAngles;
+        }
+        return;
+    }
+
+    if (md == MODE_ROLL && selId >= 0) {
+        if (inp.mdown) {
+            vec2 delta = inp.mpos - dragStart;
+            vec4 dQuat = ld(buf, 0, ROW_DRAG_ROT);
+            float rz = delta.x / res.x * PI * TF_ROT_SENS;
+            if (inp.kctrl) rz = snap(rz, TF_SNAP_ROT);
+
+            Obj obj = loadObj(buf, selId);
+            r.flags = r. flags | CHG_OBJECT;
+            r.targetId = selId;
+            r.objPos = obj.pos;
+            r.objSiz = obj.siz;
+            r.objCol = obj.col;
+            r.objQuat = applyWorldRot(dQuat, 0.0, 0.0, rz);
+        }
+        return;
+    }
+
+    if (inp.mpressed && inp.kshift) {
+        r.flags = r. flags | CHG_SELECTION | CHG_CAMERA;
+        r.selId = selId;
+        r.imode = MODE_CAMERA;
+        r. transMode = ld(buf, 0, ROW_SELECT).z;
+        r.actPart = int(ld(buf, 0, ROW_SELECT).w);
+        r.dragStart = inp.mpos;
+        r.dragAngles = angles;
+        r.camPos = camPos;
+        r.camDir = camDir;
+        r.angles = angles;
+        return;
+    }
+
+    if (inp. mpressed && inp.kalt && selId >= 0) {
+        int cnt = getObjCount(buf);
+        if (selId < cnt) {
+            Obj obj = loadObj(buf, selId);
+            float tm = ld(buf, 0, ROW_SELECT).z;
+
+            if (! isLightTyp(obj.typ) && tm == TRANS_ROTATE) {
+                r.flags = r. flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG | CHG_UNDO;
+
+                r.selId = selId;
+                r.imode = MODE_ROLL;
+                r. transMode = tm;
+                r. actPart = int(ld(buf, 0, ROW_SELECT).w);
+
+                r.dragStart = inp.mpos;
+                r. dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+                r. camPos = camPos;
+                r. camDir = camDir;
+                r. angles = angles;
+
+                r.dragQuat = obj.quat;
+
+                r.targetId = selId;
+                r.undoPos = obj.pos;
+                r. undoSiz = obj.siz;
+                r.undoQuat = obj.quat;
+            }
+        }
+        return;
+    }
+
+    if (inp.mpressed && !inp.kshift && !inp.kalt) {
+        float asp = res.x / res.y;
+        float fov = radians(CAM_FOV);
+        int cnt = getObjCount(buf);
+
+        Ray pickRay = createRay(inp. mpos / res, camPos, camDir, fov, asp);
+        Hit hit = traceSceneAnalytic(pickRay, buf, cnt, true);
+
+        if (hit.id < 0) {
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA;
+            r.selId = ID_NONE;
+            r.imode = MODE_CAMERA;
+            r. transMode = ld(buf, 0, ROW_SELECT).z;
+            r.actPart = PART_NONE;
+            r.dragStart = inp.mpos;
+            r.dragAngles = angles;
+            r. camPos = camPos;
+            r. camDir = camDir;
+            r. angles = angles;
+        }
+    }
+}
+
+void procKeyboardInp(InpState inp, int selId, float transMode, int frame, sampler2D buf, sampler2D kb, inout IxResult r) {
+    vec4 prevKeys = ld(buf, 0, ROW_KEYS);
+    vec4 prevKeys2 = ld(buf, 1, ROW_KEYS);
+
+    bool kW = keyDown(KEY_W, kb);
+    bool kE = keyDown(KEY_E, kb);
+    bool kR = keyDown(KEY_R, kb);
+    bool kF = keyDown(KEY_F, kb);
+    bool kZ = keyDown(KEY_Z, kb);
+    bool kC = keyDown(KEY_C, kb);
+    bool kV = keyDown(KEY_V, kb);
+    bool kDel = keyDown(KEY_DELETE, kb);
+
+    bool kWJust = kW && prevKeys.x < 0.5;
+    bool kEJust = kE && prevKeys.y < 0.5;
+    bool kRJust = kR && prevKeys. z < 0.5;
+    bool kFJust = kF && prevKeys.w < 0.5;
+    bool kZJust = kZ && prevKeys2.x < 0.5;
+    bool kCJust = kC && prevKeys2.y < 0.5;
+    bool kVJust = kV && prevKeys2.z < 0.5;
+    bool kDelJust = kDel && prevKeys2.w < 0.5;
+
+    int cnt = getObjCount(buf);
+
+    if (selId >= 0 && ! inp.kshift && !inp. kalt && ! inp.kctrl) {
+        if (kWJust) {
+            r.flags = r.flags | CHG_SELECTION;
+            r.selId = selId;
+            r.imode = ld(buf, 0, ROW_SELECT).y;
+            r.transMode = TRANS_TRANSLATE;
+            r.actPart = PART_NONE;
+        }
+        if (kEJust) {
+            r.flags = r.flags | CHG_SELECTION;
+            r. selId = selId;
+            r. imode = ld(buf, 0, ROW_SELECT).y;
+            r. transMode = TRANS_ROTATE;
+            r.actPart = PART_NONE;
+        }
+        if (kRJust) {
+            r. flags = r.flags | CHG_SELECTION;
+            r.selId = selId;
+            r.imode = ld(buf, 0, ROW_SELECT).y;
+            r.transMode = TRANS_SCALE;
+            r.actPart = PART_NONE;
+        }
+    }
+
+    if (kFJust && selId >= 0 && selId < cnt && ! inp.kctrl) {
+        Obj obj = loadObj(buf, selId);
+        vec3 camDir = ld(buf, 2, ROW_CAMERA).xyz;
+        if (length(camDir) < 0.001) camDir = vec3(0.0, 0.0, 1.0);
+        
+        float objSize = max(max(obj. siz.x, obj.siz. y), obj.siz.z);
+        if (isLightTyp(obj.typ)) objSize = obj.siz.x;
+        
+        vec3 focusPos = obj.pos - normalize(camDir) * (objSize + CAM_FOCUS_DIST);
+        
+        r.flags = r.flags | CHG_CAMERA;
+        r.camPos = focusPos;
+        r. camDir = camDir;
+        r. angles = ld(buf, 1, ROW_CAMERA).xy;
+        r. dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+        r. dragStart = ld(buf, 0, ROW_CAMERA).xy;
+    }
+    
+    if (kDelJust && selId >= 0 && selId < cnt) {
+        r.flags = r. flags | CHG_DELETE | CHG_SELECTION;
+        r.targetId = selId;
+        r.selId = ID_NONE;
+        r.imode = MODE_NONE;
+        r.transMode = transMode;
+        r.actPart = PART_NONE;
+    }
+
+    if (inp.kctrl && kZJust) {
+        vec4 undoData = ld(buf, 0, ROW_UNDO);
+        int undoId = int(undoData. x);
+        if (undoId >= 0 && undoId < cnt) {
+            r.flags = r. flags | CHG_UNDO_EXEC | CHG_OBJECT;
+            r. targetId = undoId;
+            r.objPos = ld(buf, 1, ROW_UNDO).xyz;
+            r. objSiz = ld(buf, 2, ROW_UNDO).xyz;
+            r.objQuat = ld(buf, 0, ROW_UNDO_ROT);
+            r.objCol = ld(buf, undoId, ROW_COLORS).xyz;
+        }
+    }
+
+    if (inp.kctrl && kCJust && selId >= 0 && selId < cnt) {
+        vec4 od1 = ld(buf, selId * 2 + 1, ROW_OBJECTS);
+        vec4 od2 = ld(buf, selId * 2 + 2, ROW_OBJECTS);
+        r.flags = r. flags | CHG_CLIPBOARD;
+        r. clipTyp = int(od1.x);
+        r.clipPos = od1.yzw;
+        r.clipSiz = od2.xyz;
+        r. clipCol = ld(buf, selId, ROW_COLORS).xyz;
+        r.clipQuat = ld(buf, selId, ROW_ROTATIONS);
+    }
+
+    if (inp.kctrl && kVJust) {
+        vec4 clipData = ld(buf, 0, ROW_CLIPBOARD);
+        int clipTyp = int(clipData.x);
+        if (clipTyp != OBJ_NONE) {
+            int newId = cnt;
+            for (int i = 0; i < MAX_OBJECTS; i++) {
+                if (int(ld(buf, i * 2 + 1, ROW_OBJECTS).x) == OBJ_NONE) { newId = i; break; }
+            }
+            if (newId < MAX_OBJECTS) {
+                vec4 clipData2 = ld(buf, 1, ROW_CLIPBOARD);
+                vec3 clipCol = ld(buf, 2, ROW_CLIPBOARD).xyz;
+
+                r.flags = r. flags | CHG_ADD | CHG_SELECTION | CHG_PICKER;
+                r. targetId = newId;
+                r. addTyp = clipTyp;
+                r.addPos = clipData. yzw + vec3(0.3, 0.0, 0.3);
+                r. addSiz = clipData2.xyz;
+                r.addCol = clipCol;
+
+                r.selId = newId;
+                r.imode = MODE_NONE;
+                r.transMode = transMode;
+                r.actPart = PART_NONE;
+
+                r. hsv = rgb2hsv(clipCol);
+                r.pickerPos = ld(buf, 1, ROW_PICKER).xy;
+            }
+        }
+    }
+}
+
+void procCameraMove(InpState inp, int selId, vec3 camPos, vec3 camDir, vec2 angles, sampler2D kb, sampler2D buf, inout IxResult r) {
+    bool canMove = (selId < 0) || inp.kshift;
+    if (!canMove) return;
+    
+    float spd = CAM_SPEED;
+    if (inp.kshift && selId < 0) spd = spd * CAM_SPRINT;
+    
+    vec3 fwd = normalize(camDir);
+    vec3 rt = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
+    if (length(cross(fwd, vec3(0.0, 1.0, 0.0))) < 0.001) {
+        rt = vec3(1.0, 0.0, 0.0);
+    }
+    
+    vec3 newPos = camPos;
+    bool moved = false;
+    
+    bool useW = (selId < 0) || inp.kshift;
+    if (useW && keyDown(KEY_W, kb)) { newPos = newPos + fwd * spd; moved = true; }
+    
+    if (keyDown(KEY_S, kb)) { newPos = newPos - fwd * spd; moved = true; }
+    if (keyDown(KEY_A, kb)) { newPos = newPos - rt * spd; moved = true; }
+    if (keyDown(KEY_D, kb)) { newPos = newPos + rt * spd; moved = true; }
+    
+    if (keyDown(KEY_SPACE, kb)) { newPos. y = newPos.y + spd; moved = true; }
+    
+    bool useCtrl = (selId < 0) || inp.kshift;
+    if (useCtrl && keyDown(KEY_CTRL, kb)) { newPos. y = newPos.y - spd; moved = true; }
+
+    if (moved) {
+        r. flags = r.flags | CHG_CAMERA;
+        r. camPos = newPos;
+        r. camDir = camDir;
+        r. angles = angles;
+        r.dragStart = ld(buf, 0, ROW_CAMERA).xy;
+        r.dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+    }
+}
+
+//=============================================================================
+// 主交互处理
+//=============================================================================
+
+IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampler2D buf, sampler2D kb) {
+    IxResult r = initIxResult();
+
+    vec4 mouseState = ld(buf, 0, ROW_CAMERA);
+    vec4 anglesData = ld(buf, 1, ROW_CAMERA);
+    vec3 camDir = ld(buf, 2, ROW_CAMERA).xyz;
+    vec3 camPos = ld(buf, 3, ROW_CAMERA).xyz;
+    vec4 selData = ld(buf, 0, ROW_SELECT);
+
+    int selId = int(selData.x);
+    float md = selData.y;
+    float transMode = selData. z;
+    int actPart = int(selData.w);
+    vec2 angles = anglesData.xy;
+    vec2 dragAngles = anglesData.zw;
+    vec2 dragStart = mouseState.xy;
+
+    if (length(camDir) < 0.001) {
+        camDir = vec3(0.0, 0.0, 1.0);
+    }
+
+    procKeyboardInp(inp, selId, transMode, frame, buf, kb, r);
+    procCameraMove(inp, selId, camPos, camDir, angles, kb, buf, r);
+    
+    if ((r.flags & CHG_CAMERA) != 0u) {
+        camPos = r.camPos;
+    }
+
+    if (inp.mreleased) {
+        if (md == MODE_CAMERA) {
+            r.flags = r. flags | CHG_CAMERA;
+            r.camPos = camPos;
+            r.camDir = camDir;
+            r.angles = angles;
+            r.dragStart = dragStart;
+            r.dragAngles = angles;
+        }
+        r.flags = r. flags | CHG_SELECTION;
+        r.selId = selId;
+        r.imode = MODE_NONE;
+        r.transMode = transMode;
+        r.actPart = PART_NONE;
+        return r;
+    }
+
+    if (procPickerInp(inp, res, selId, md, buf, r)) return r;
+    if (procUIInp(inp, res, selId, transMode, camPos, camDir, frame, buf, r)) return r;
+    if (procGizmoInp(inp, res, selId, md, transMode, actPart, camPos, camDir, dragStart, buf, r)) return r;
+    if (procSceneInp(inp, res, selId, transMode, camPos, camDir, buf, r)) return r;
+
+    procCameraInp(inp, res, selId, md, angles, dragAngles, dragStart, camPos, camDir, kb, buf, r);
+
+    return r;
+}
+
+//=============================================================================
+// 状态初始化
+//=============================================================================
+
+void initDefaultObjs(out Obj objs[MAX_OBJECTS], out int cnt) {
+    cnt = 5;
+    objs[0] = Obj(OBJ_SPHERE, vec3(-0.5, -1.5, 0.0), vec3(0.5), vec3(0.9, 0.6, 0.3), quatId());
+    objs[1] = Obj(OBJ_BOX, vec3(0.65, -1.05, 0.35), vec3(0.55, 0.9, 0.55), vec3(0.3, 0.6, 0.9), quatId());
+    objs[2] = Obj(OBJ_POINT_LIGHT, vec3(-1.0, 0.5, -0.5), vec3(1.0), vec3(1.0, 0.95, 0.8), quatId());
+    objs[3] = Obj(OBJ_SPOT_LIGHT, vec3(0.0, 1.5, 0.0), vec3(1.2), vec3(1.0, 0.9, 0.7), quatId());
+    objs[4] = Obj(OBJ_AREA_LIGHT, vec3(1.2, 0.0, -1.5), vec3(1.0), vec3(0.8, 0.9, 1.0), quatAxis(vec3(1.0, 0.0, 0.0), PI));
+    for (int i = 5; i < MAX_OBJECTS; i++) {
+        objs[i] = Obj(OBJ_NONE, vec3(0.0), vec3(0.0), vec3(0.0), quatId());
+    }
+}
+
+vec4 initState(ivec2 px, vec2 res) {
+    if (px.y == ROW_CAMERA) {
+        if (px.x == 2) return vec4(0.0, 0.0, 1.0, 0.0);
+        if (px.x == 3) return vec4(CAM_INIT_POS, 1.0);
+        return vec4(0.0);
+    }
+    if (px.y == ROW_SELECT && px.x == 0) return vec4(float(ID_NONE), MODE_NONE, TRANS_TRANSLATE, float(PART_NONE));
+
+    Obj objs[MAX_OBJECTS];
+    int cnt;
+    initDefaultObjs(objs, cnt);
+
+    if (px.y == ROW_OBJECTS) {
+        if (px.x == 0) return vec4(float(cnt), 0.0, 0.0, 0.0);
+        int idx = (px.x - 1) / 2;
+        int dt = (px.x - 1) - idx * 2;
+        if (idx < MAX_OBJECTS) {
+            if (dt == 0) return vec4(float(objs[idx].typ), objs[idx].pos);
+            else return vec4(objs[idx].siz, 0.0);
+        }
+    }
+    if (px.y == ROW_COLORS && px.x < MAX_OBJECTS) return vec4(objs[px.x]. col, 0.0);
+    if (px.y == ROW_ROTATIONS && px.x < MAX_OBJECTS) return objs[px.x].quat;
+    if (px.y == ROW_DRAG_ROT && px.x == 0) return quatId();
+    if (px.y == ROW_CLIPBOARD && px.x == 0) return vec4(float(OBJ_NONE), 0.0, 0.0, 0.0);
+    if (px.y == ROW_CLIP_ROT && px.x == 0) return quatId();
+    if (px. y == ROW_UNDO && px.x == 0) return vec4(-1.0, 0.0, 0.0, 0.0);
+    if (px. y == ROW_UNDO_ROT && px.x == 0) return quatId();
+    if (px.y == ROW_PICKER && px.x == 0) return vec4(0.0, 1.0, 1.0, 0.0);
+    if (px.y == ROW_PICKER && px.x == 1) {
+        vec2 defPos = getPickerDefaultPos(res);
+        return vec4(defPos, 0.0, 0.0);
+    }
+    if (px.y == ROW_UI && px.x == 0) return vec4(float(ACT_NONE), 0.0, 0.0, 0.0);
+    return vec4(0.0);
+}
+
+//=============================================================================
+// 应用交互结果
+//=============================================================================
+
+vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf, sampler2D kb, vec2 res, int frame) {
+
+    if (px.y == ROW_CAMERA) {
+        vec4 oldMouse = ld(buf, 0, ROW_CAMERA);
+        vec4 oldAngs = ld(buf, 1, ROW_CAMERA);
+        vec4 oldDir = ld(buf, 2, ROW_CAMERA);
+        vec4 oldPos = ld(buf, 3, ROW_CAMERA);
+
+        if (px.x == 0) {
+            vec2 ds = (r.flags & CHG_CAMERA) != 0u ? r.dragStart :  oldMouse.xy;
+            return vec4(ds, inp.mdown ?  1.0 : 0.0, 0.0);
+        }
+        if (px.x == 1) {
+            vec2 angs = (r. flags & CHG_CAMERA) != 0u ? r. angles : oldAngs. xy;
+            vec2 dAngs = (r. flags & CHG_CAMERA) != 0u ? r. dragAngles : oldAngs.zw;
+            return vec4(angs, dAngs);
+        }
+        if (px.x == 2) {
+            vec3 dir = (r.flags & CHG_CAMERA) != 0u ? r.camDir : oldDir. xyz;
+            return vec4(dir, 0.0);
+        }
+        if (px.x == 3) {
+            vec3 pos = (r.flags & CHG_CAMERA) != 0u ? r.camPos : oldPos. xyz;
+            return vec4(pos, 1.0);
+        }
+    }
+
+    if (px.y == ROW_SELECT && px.x == 0) {
+        if ((r.flags & CHG_SELECTION) != 0u) {
+            return vec4(float(r.selId), r.imode, r.transMode, float(r.actPart));
+        }
+        return ld(buf, 0, ROW_SELECT);
+    }
+
+    if (px. y == ROW_OBJECTS) {
+        int oldCnt = int(ld(buf, 0, ROW_OBJECTS).x);
+        int newCnt = oldCnt;
+
+        if ((r. flags & CHG_ADD) != 0u && r.targetId >= oldCnt) {
+            newCnt = r.targetId + 1;
+        }
+
+        if (px.x == 0) return vec4(float(newCnt), 0.0, 0.0, 0.0);
+
+        int idx = (px. x - 1) / 2;
+        int dt = (px.x - 1) - idx * 2;
+
+        if (idx < MAX_OBJECTS) {
+            if ((r.flags & CHG_OBJECT) != 0u && r.targetId == idx) {
+                if (dt == 0) return vec4(float(ld(buf, idx * 2 + 1, ROW_OBJECTS).x), r.objPos);
+                else return vec4(r.objSiz, 0.0);
+            }
+            if ((r.flags & CHG_ADD) != 0u && r.targetId == idx) {
+                if (dt == 0) return vec4(float(r.addTyp), r.addPos);
+                else return vec4(r.addSiz, 0.0);
+            }
+            if ((r. flags & CHG_DELETE) != 0u && r.targetId == idx) {
+                if (dt == 0) return vec4(float(OBJ_NONE), vec3(0.0));
+                else return vec4(0.0);
+            }
+            if ((r.flags & CHG_UNDO_EXEC) != 0u && r. targetId == idx) {
+                if (dt == 0) return vec4(float(ld(buf, idx * 2 + 1, ROW_OBJECTS).x), r.objPos);
+                else return vec4(r.objSiz, 0.0);
+            }
+        }
+        return ld(buf, px.x, ROW_OBJECTS);
+    }
+
+    if (px. y == ROW_COLORS && px.x < MAX_OBJECTS) {
+        if ((r.flags & CHG_OBJECT) != 0u && r.targetId == px.x) return vec4(r.objCol, 0.0);
+        if ((r.flags & CHG_ADD) != 0u && r.targetId == px.x) return vec4(r. addCol, 0.0);
+        return ld(buf, px.x, ROW_COLORS);
+    }
+
+    if (px.y == ROW_ROTATIONS && px. x < MAX_OBJECTS) {
+        if ((r.flags & CHG_OBJECT) != 0u && r.targetId == px.x) return r.objQuat;
+        if ((r.flags & CHG_ADD) != 0u && r.targetId == px.x) return quatId();
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && r.targetId == px.x) return r.objQuat;
+        return ld(buf, px.x, ROW_ROTATIONS);
+    }
+
+    if (px. y == ROW_DRAG) {
+        if ((r.flags & CHG_DRAG) != 0u) {
+            if (px.x == 0) return vec4(r.dragVal, 0.0);
+            if (px.x == 1) return vec4(r.dragPlane, 0.0);
+            if (px.x == 2) return vec4(r.dragAngle, 0.0, 0.0, 0.0);
+        }
+        return ld(buf, px.x, ROW_DRAG);
+    }
+
+    if (px.y == ROW_DRAG_ROT && px.x == 0) {
+        if ((r.flags & CHG_DRAG) != 0u) return r.dragQuat;
+        return ld(buf, 0, ROW_DRAG_ROT);
+    }
+
+    if (px. y == ROW_KEYS) {
+        bool kW = keyDown(KEY_W, kb);
+        bool kE = keyDown(KEY_E, kb);
+        bool kR = keyDown(KEY_R, kb);
+        bool kF = keyDown(KEY_F, kb);
+        bool kZ = keyDown(KEY_Z, kb);
+        bool kC = keyDown(KEY_C, kb);
+        bool kV = keyDown(KEY_V, kb);
+        bool kDel = keyDown(KEY_DELETE, kb);
+
+        if (px. x == 0) return vec4(kW ?  1.0 : 0.0, kE ? 1.0 :  0.0, kR ? 1.0 : 0.0, kF ? 1.0 : 0.0);
+        if (px.x == 1) return vec4(kZ ? 1.0 : 0.0, kC ? 1.0 : 0.0, kV ?  1.0 : 0.0, kDel ?  1.0 : 0.0);
+    }
+
+    if (px.y == ROW_CLIPBOARD) {
+        if ((r.flags & CHG_CLIPBOARD) != 0u) {
+            if (px.x == 0) return vec4(float(r.clipTyp), r.clipPos);
+            if (px. x == 1) return vec4(r.clipSiz, 0.0);
+            if (px. x == 2) return vec4(r.clipCol, 0.0);
+        }
+        return ld(buf, px.x, ROW_CLIPBOARD);
+    }
+
+    if (px.y == ROW_CLIP_ROT && px.x == 0) {
+        if ((r.flags & CHG_CLIPBOARD) != 0u) return r.clipQuat;
+        return ld(buf, 0, ROW_CLIP_ROT);
+    }
+
+    if (px.y == ROW_UNDO) {
+        if ((r.flags & CHG_UNDO) != 0u) {
+            if (px.x == 0) return vec4(float(r.targetId), 0.0, 0.0, 0.0);
+            if (px.x == 1) return vec4(r.undoPos, 0.0);
+            if (px.x == 2) return vec4(r.undoSiz, 0.0);
+        }
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && px.x == 0) return vec4(-1.0, 0.0, 0.0, 0.0);
+        return ld(buf, px.x, ROW_UNDO);
+    }
+
+    if (px. y == ROW_UNDO_ROT && px.x == 0) {
+        if ((r.flags & CHG_UNDO) != 0u) return r.undoQuat;
+        return ld(buf, 0, ROW_UNDO_ROT);
+    }
+
+    if (px.y == ROW_PICKER) {
+        if ((r.flags & CHG_PICKER) != 0u) {
+            if (px.x == 0) return vec4(r.hsv, 0.0);
+            if (px.x == 1) {
+                vec2 dragS = r.pickerDrag;
+                vec4 oldData = ld(buf, 1, ROW_PICKER);
+                if (r.pickerDrag.x == 0.0 && r.pickerDrag.y == 0.0) dragS = oldData.zw;
+                return vec4(r.pickerPos, dragS);
+            }
+        }
+        return ld(buf, px.x, ROW_PICKER);
+    }
+
+    if (px.y == ROW_UI && px.x == 0) {
+        vec4 oldData = ld(buf, 0, ROW_UI);
+        int lastClk = int(oldData.x);
+        float lastT = oldData.y;
+        float curT = float(frame) / 60.0;
+
+        if ((r.flags & CHG_UI) != 0u) {
+            lastClk = r.lastClick;
+            lastT = r.clickTime;
+        } else if (lastClk != ACT_NONE && curT - lastT > 0.3) {
+            lastClk = ACT_NONE;
+        }
+        return vec4(float(lastClk), lastT, 0.0, 0.0);
+    }
+
+    return vec4(0.0);
+}
+
+//=============================================================================
+// 主入口
+//=============================================================================
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    ivec2 px = ivec2(fragCoord);
+    vec2 res = iResolution.xy;
+    
+    if (px.y > ROW_UI) {
+        fragColor = vec4(0.0);
+        return;
+    }
+
+    if (iFrame == 0) {
+        fragColor = initState(px, res);
+        return;
+    }
+
+    vec4 mouseState = ld(iChannel0, 0, ROW_CAMERA);
+    float prevDown = mouseState.z;
+    InpState inp = gatherInp(iMouse, iChannel1, prevDown);
+
+    IxResult r = processInteraction(inp, iMouse, res, iFrame, iChannel0, iChannel1);
+
+    fragColor = applyIxResult(px, r, inp, iChannel0, iChannel1, res, iFrame);
+}

@@ -1,0 +1,31 @@
+// Buffer B - 反照率体素生成 (Albedo Volume)
+// iChannel0: Buffer D (场景数据)
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    int cnt = getObjCount(iChannel0);
+    
+    float posidx = packfragcoord2(fragCoord.xy, iResolution.xy);
+    float totalVoxels = lpvsize.x * lpvsize.y * lpvsize.z;
+    
+    if (posidx >= totalVoxels) {
+        fragColor = vec4(0.0);
+        return;
+    }
+    
+    vec3 voxelCoord = unpackfragcoord3(posidx, lpvsize);
+    
+    vec3 uvw = voxelCoord / lpvsize;
+    vec3 wpos = uvw * LPV_BOUNDS_SIZE + LPV_BOUNDS_MIN;
+    
+    float voxelSize = LPV_BOUNDS_SIZE.x / lpvsize.x;
+    float r = voxelSize * 0.87;
+    
+    SDFResult res = sdScene(wpos, iChannel0, cnt, true);
+    
+    if (res.d < r) {
+        fragColor = vec4(res.col, 1.0);
+    } else {
+        fragColor = vec4(0.0);
+    }
+}
