@@ -46,6 +46,145 @@ bool procUIInp(InpState inp, vec2 res, int selId, float transMode,
 }
 
 //=============================================================================
+// Property Panel & Slider 交互处理
+//=============================================================================
+
+bool procPanelInp(InpState inp, vec2 res, int selId, float md,
+                  vec3 camPos, vec3 camDir, sampler2D buf, inout IxResult r) {
+    // Load current material state
+    vec4 matData0 = ld(buf, 0, ROW_MATERIAL);
+    vec4 matData1 = ld(buf, 1, ROW_MATERIAL);
+    float exposure  = matData0.x;
+    float sunAngle  = matData0.y;
+    float roughness = matData0.z;
+    float metalness = matData0.w;
+    vec3  hsv       = matData1.xyz;
+
+    vec4 panelData = ld(buf, 0, ROW_PANEL);
+    int curSlider = int(panelData.x);
+    float sliderDragOrig = panelData.y;
+
+    // Currently dragging a slider
+    if (md == MODE_SLIDER) {
+        if (inp.mdown && curSlider != SLIDER_NONE) {
+            SliderRect sr = getSliderById(curSlider, res, selId, exposure, sunAngle, roughness, metalness);
+            float newVal = sliderDragValue(inp.mpos, sr);
+            r.flags = r.flags | CHG_MATERIAL | CHG_PANEL;
+            r.exposure = exposure;
+            r.sunAngle = sunAngle;
+            r.roughness = roughness;
+            r.metalness = metalness;
+            r.hsv = hsv;
+            r.sliderId = curSlider;
+            r.sliderDragStart = sliderDragOrig;
+            if (curSlider == SLIDER_EXPOSURE)  r.exposure  = newVal;
+            if (curSlider == SLIDER_SUN)       r.sunAngle  = newVal;
+            if (curSlider == SLIDER_ROUGHNESS) r.roughness = newVal;
+            if (curSlider == SLIDER_METALNESS) r.metalness = newVal;
+            return true;
+        }
+        return false;
+    }
+
+    // Try to click a slider on mouse press
+    if (inp.mpressed) {
+        bool hasSel = (selId >= 0);
+        if (insidePanel(inp.mpos, res, hasSel)) {
+            int hit = checkPanelSliderClick(inp.mpos, res, selId, exposure, sunAngle, roughness, metalness);
+            if (hit != SLIDER_NONE) {
+                SliderRect sr = getSliderById(hit, res, selId, exposure, sunAngle, roughness, metalness);
+                r.flags = r.flags | CHG_SELECTION | CHG_PANEL | CHG_MATERIAL;
+                r.selId = selId;
+                r.imode = MODE_SLIDER;
+                r.transMode = ld(buf, 0, ROW_STATE).z;
+                r.actPart = PART_NONE;
+                r.sliderId = hit;
+                r.sliderDragStart = sr.val;
+                r.exposure = exposure;
+                r.sunAngle = sunAngle;
+                r.roughness = roughness;
+                r.metalness = metalness;
+                r.hsv = hsv;
+                return true;
+            }
+            // Click inside panel but not on slider → consume to block passthrough
+            return true;
+        }
+    }
+    return false;
+}
+
+//=============================================================================
+// Color Picker 交互处理
+//=============================================================================
+
+bool procPickerInp(InpState inp, vec2 res, int selId, float md,
+                   sampler2D buf, inout IxResult r) {
+    if (selId < 0) return false;  // picker only shown when object selected
+
+    vec4 matData0 = ld(buf, 0, ROW_MATERIAL);
+    vec4 matData1 = ld(buf, 1, ROW_MATERIAL);
+    float exposure  = matData0.x;
+    float sunAngle  = matData0.y;
+    float roughness = matData0.z;
+    float metalness = matData0.w;
+    vec3  hsv       = matData1.xyz;
+
+    // Currently dragging in picker
+    if (md == MODE_PICKER_SV || md == MODE_PICKER_H) {
+        if (inp.mdown) {
+            vec3 newHSV = getPickerHSV(inp.mpos, res, hsv, md == MODE_PICKER_SV ? MODE_PICKER_SV : MODE_PICKER_H);
+            r.flags = r.flags | CHG_MATERIAL;
+            r.hsv = newHSV;
+            r.exposure = exposure;
+            r.sunAngle = sunAngle;
+            r.roughness = roughness;
+            r.metalness = metalness;
+            return true;
+        }
+        return false;
+    }
+
+    // Try to click picker on mouse press
+    if (inp.mpressed && insidePicker(inp.mpos, res)) {
+        int region = checkPickerClick(inp.mpos, res);
+        if (region == 1) {
+            // SV area click
+            vec3 newHSV = getPickerHSV(inp.mpos, res, hsv, MODE_PICKER_SV);
+            r.flags = r.flags | CHG_SELECTION | CHG_MATERIAL;
+            r.selId = selId;
+            r.imode = MODE_PICKER_SV;
+            r.transMode = ld(buf, 0, ROW_STATE).z;
+            r.actPart = PART_NONE;
+            r.hsv = newHSV;
+            r.exposure = exposure;
+            r.sunAngle = sunAngle;
+            r.roughness = roughness;
+            r.metalness = metalness;
+            return true;
+        }
+        if (region == 2) {
+            // Hue bar click
+            vec3 newHSV = getPickerHSV(inp.mpos, res, hsv, MODE_PICKER_H);
+            r.flags = r.flags | CHG_SELECTION | CHG_MATERIAL;
+            r.selId = selId;
+            r.imode = MODE_PICKER_H;
+            r.transMode = ld(buf, 0, ROW_STATE).z;
+            r.actPart = PART_NONE;
+            r.hsv = newHSV;
+            r.exposure = exposure;
+            r.sunAngle = sunAngle;
+            r.roughness = roughness;
+            r.metalness = metalness;
+            return true;
+        }
+        // Click inside picker area but not in SV/H → consume
+        return true;
+    }
+    return false;
+}
+
+//=============================================================================
 // Scene picking (analytical intersection for object selection)
 //=============================================================================
 
@@ -485,6 +624,17 @@ IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampl
             r.dragStart = dragStart;
             r.dragAngles = angles;
         }
+        if (md == MODE_SLIDER || md == MODE_PICKER_SV || md == MODE_PICKER_H) {
+            // Keep material state on release
+            vec4 matData0 = ld(buf, 0, ROW_MATERIAL);
+            vec4 matData1 = ld(buf, 1, ROW_MATERIAL);
+            r.flags = r.flags | CHG_MATERIAL;
+            r.exposure = matData0.x;
+            r.sunAngle = matData0.y;
+            r.roughness = matData0.z;
+            r.metalness = matData0.w;
+            r.hsv = matData1.xyz;
+        }
         r.flags = r.flags | CHG_SELECTION;
         r.selId = selId;        // keep selection
         r.imode = MODE_NONE;
@@ -499,8 +649,19 @@ IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampl
     // 阻止工具栏区域的鼠标穿透到 Gizmo/场景/相机
     bool onToolbar = (inp.mpressed && getToolbarAlpha(inp.mpos, res) > 0.5);
 
+    // Property Panel / Slider 交互 (高优先级)
+    if (procPanelInp(inp, res, selId, md, camPos, camDir, buf, r)) return r;
+
+    // Color Picker 交互
+    if (procPickerInp(inp, res, selId, md, buf, r)) return r;
+
+    // 阻止面板/拾色器区域穿透
+    bool hasSel = (selId >= 0);
+    bool onPanel = (inp.mpressed && insidePanel(inp.mpos, res, hasSel));
+    bool onPicker = (inp.mpressed && hasSel && insidePicker(inp.mpos, res));
+
     // 分层交互优先级：Gizmo > 场景选择 > 相机
-    if (!onToolbar) {
+    if (!onToolbar && !onPanel && !onPicker) {
         if (procGizmoInp(inp, res, selId, md, transMode, actPart, camPos, camDir, dragStart, buf, r)) return r;
         if (procSceneInp(inp, res, selId, transMode, camPos, camDir, buf, r)) return r;
     }
@@ -557,6 +718,18 @@ vec4 initState(ivec2 px, vec2 res) {
     }
     if (px.y == ROW_CLIP_ROT) {
         return quatId();
+    }
+    if (px.y == ROW_MATERIAL) {
+        // x=exposure, y=sunAngle, z=roughness, w=metalness
+        if (px.x == 0) return vec4(1.0, 0.0, 0.5, 0.0);
+        // x=h, y=s, z=v  (default white)
+        if (px.x == 1) return vec4(0.0, 0.0, 1.0, 0.0);
+        return vec4(0.0);
+    }
+    if (px.y == ROW_PANEL) {
+        // x=sliderId (-1=none), y=sliderDragStart
+        if (px.x == 0) return vec4(-1.0, 0.0, 0.0, 0.0);
+        return vec4(0.0);
     }
     return vec4(0.0);
 }
@@ -697,6 +870,23 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf, sampler2D 
         return ld(buf, px.x, ROW_CLIP_ROT);
     }
 
+    // Material state storage
+    if (px.y == ROW_MATERIAL) {
+        if ((r.flags & CHG_MATERIAL) != 0u) {
+            if (px.x == 0) return vec4(r.exposure, r.sunAngle, r.roughness, r.metalness);
+            if (px.x == 1) return vec4(r.hsv, 0.0);
+        }
+        return ld(buf, px.x, ROW_MATERIAL);
+    }
+
+    // Panel state storage
+    if (px.y == ROW_PANEL) {
+        if ((r.flags & CHG_PANEL) != 0u) {
+            if (px.x == 0) return vec4(float(r.sliderId), r.sliderDragStart, 0.0, 0.0);
+        }
+        return ld(buf, px.x, ROW_PANEL);
+    }
+
     return vec4(0.0);
 }
 
@@ -709,7 +899,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 res = iResolution.xy;
 
     // 只处理相关行
-    if (px.y > ROW_CLIP_ROT) {
+    if (px.y > ROW_PANEL) {
         fragColor = vec4(0.0);
         return;
     }

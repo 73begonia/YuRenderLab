@@ -16,6 +16,14 @@ vec4 g_tallboxQuat;
 vec3 g_sphereSize;
 vec3 g_tallboxSize;
 
+// Dynamic material parameters (set in mainImage from BufferD)
+float g_exposure;
+float g_sunAngle;
+float g_roughness;
+float g_metalness;
+vec3  g_albedoHSV;
+int   g_selId;
+
 // PBR + IBL rendering of a Cornell box scene.
 // No direct lights, no shadows, no normal maps.
 // Diffuse IBL via spherical harmonics (BufferA).
@@ -24,7 +32,6 @@ vec3 g_tallboxSize;
 #define TONEMAPPING
 
 const float AMBIENT_STRENGTH = 1.0;
-const float EXPOSURE = 1.0;
 
 // Raymarching
 const float EPSILON = 1e-3;
@@ -154,21 +161,24 @@ vec3 getNormal(vec3 p)
 vec3 getAlbedo(int matId) {
     if (matId == MAT_LEFT)  return vec3(0.14, 0.45, 0.091);  // Green
     if (matId == MAT_RIGHT) return vec3(0.63, 0.065, 0.05);  // Red
+    // Use dynamic HSV color for selected object's material
+    if ((matId == MAT_SPHERE && g_selId == OBJ_SPHERE_ID) ||
+        (matId == MAT_TALL   && g_selId == OBJ_TALLBOX_ID))
+        return hsv2rgb(g_albedoHSV);
     return vec3(0.73);  // White for all others
 }
 
 float getRoughness(int matId) {
     float roughness = 0.8;
-    if (matId == MAT_SPHERE) roughness = 0.2;
-    if (matId == MAT_TALL)   roughness = 0.6;
-    // Clamp to avoid extreme values (0 causes NaN, 1 causes atlas sampling issues)
+    if (matId == MAT_SPHERE) roughness = (g_selId == OBJ_SPHERE_ID) ? g_roughness : 0.2;
+    if (matId == MAT_TALL)   roughness = (g_selId == OBJ_TALLBOX_ID) ? g_roughness : 0.6;
     return clamp(roughness, 0.05, 0.999);
 }
 
 float getMetalness(int matId) {
-    if (matId == MAT_SPHERE) return 1.0;  // Metallic sphere
-    if (matId == MAT_TALL)   return 0.0;
-    return 0.0;  // Dielectric
+    if (matId == MAT_SPHERE) return (g_selId == OBJ_SPHERE_ID) ? g_metalness : 1.0;
+    if (matId == MAT_TALL)   return (g_selId == OBJ_TALLBOX_ID) ? g_metalness : 0.0;
+    return 0.0;
 }
 
 // ----------------------- Camera -----------------------
@@ -345,6 +355,18 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     if (length(g_sphereSize) < 0.001) g_sphereSize = vec3(SPHERE_RADIUS);
     if (length(g_tallboxSize) < 0.001) g_tallboxSize = TALLBOX_HALFSIZE;
 
+    // Load dynamic material parameters
+    vec4 matData0 = ld(iChannel0, 0, ROW_MATERIAL);
+    vec4 matData1 = ld(iChannel0, 1, ROW_MATERIAL);
+    g_exposure  = matData0.x > 0.001 ? matData0.x : 1.0;
+    g_sunAngle  = matData0.y;
+    g_roughness = matData0.z > 0.001 ? matData0.z : 0.5;
+    g_metalness = matData0.w;
+    g_albedoHSV = matData1.xyz;
+    // Load selection state early (needed by material functions during rendering)
+    vec4 stateData = ld(iChannel0, 0, ROW_STATE);
+    g_selId = int(stateData.y);
+
     vec3 rd = rayDirection(CAM_FOV, fragCoord);
     vec3 up = vec3(0.0, 1.0, 0.0);
     mat3 viewMatrix = lookAt(camPos, camPos + camDir, up);
@@ -387,7 +409,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         specular *= energyCompensation;
 
         // Combine
-        col = EXPOSURE * (kD * diffuse + specular);
+        col = g_exposure * (kD * diffuse + specular);
 
         #ifdef TONEMAPPING
             col = ACESFilm(col);
@@ -402,8 +424,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     col = gamma(col);
 
     // ---- Gizmo overlay (post-tonemap) ----
-    vec4 stateData = ld(iChannel0, 0, ROW_STATE);
-    int selId = int(stateData.y);
+    int selId = g_selId;
     float transMode = stateData.z;
     int actPart = int(stateData.w);
 
@@ -433,6 +454,39 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec4 axisInd = renderAxisIndicator(fragCoord, camDir);
     if (axisInd.a > 0.005) {
         col = mix(col, axisInd.rgb, axisInd.a);
+    }
+
+    // ---- Property Panel overlay (right side) ----
+    {
+        vec3 objPos = vec3(0.0);
+        vec3 objSiz = vec3(0.0);
+        if (selId >= 0) {
+            objPos = ld(iChannel0, selId, ROW_OBJECTS).xyz;
+            objSiz = ld(iChannel0, selId, ROW_SIZES).xyz;
+        }
+        vec4 panel = renderPropertyPanel(fragCoord, iResolution.xy, selId, transMode,
+                                         objPos, objSiz, g_exposure, g_sunAngle,
+                                         g_roughness, g_metalness);
+        if (panel.a > 0.005) {
+            col = mix(col, panel.rgb, panel.a);
+        }
+    }
+
+    // ---- Color Picker overlay (below toolbar, only when object selected) ----
+    {
+        vec4 picker = renderPicker(fragCoord, iResolution.xy, g_albedoHSV, selId >= 0);
+        if (picker.a > 0.005) {
+            col = mix(col, picker.rgb, picker.a);
+        }
+    }
+
+    // ---- Material Preview sphere (below color picker) ----
+    if (selId >= 0) {
+        vec3 previewAlbedo = hsv2rgb(g_albedoHSV);
+        vec4 matPrev = renderMatPreview(fragCoord, iResolution.xy, previewAlbedo, g_roughness, g_metalness);
+        if (matPrev.a > 0.005) {
+            col = mix(col, matPrev.rgb, matPrev.a);
+        }
     }
 
     fragColor = vec4(col, 1.0);

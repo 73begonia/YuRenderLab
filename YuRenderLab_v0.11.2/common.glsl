@@ -86,12 +86,17 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define ROW_UNDO_ROT 9
 #define ROW_CLIPBOARD 10
 #define ROW_CLIP_ROT 11
+#define ROW_MATERIAL 12
+#define ROW_PANEL 13
 
 // ----------------------- Interaction modes -----------------------
 
 #define MODE_NONE 0.0
 #define MODE_CAMERA 1.0
 #define MODE_TRANSFORM 2.0
+#define MODE_SLIDER 3.0
+#define MODE_PICKER_SV 4.0
+#define MODE_PICKER_H 5.0
 
 // ----------------------- Key codes -----------------------
 
@@ -121,6 +126,8 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define CHG_UNDO 16u
 #define CHG_UNDO_EXEC 32u
 #define CHG_CLIPBOARD 64u
+#define CHG_MATERIAL 128u
+#define CHG_PANEL 256u
 
 // ----------------------- Helper functions -----------------------
 
@@ -331,6 +338,14 @@ struct IxResult {
     vec3 clipPos;
     vec3 clipSiz;
     vec4 clipQuat;
+    // Material / panel fields
+    vec3 hsv;
+    float roughness;
+    float metalness;
+    float exposure;
+    float sunAngle;
+    float sliderDragStart;  // drag origin value
+    int sliderId;           // which slider is being dragged
 };
 
 IxResult initIxResult() {
@@ -359,12 +374,43 @@ IxResult initIxResult() {
     r.clipPos = vec3(0.0);
     r.clipSiz = vec3(0.0);
     r.clipQuat = quatId();
+    r.hsv = vec3(0.0);
+    r.roughness = 0.5;
+    r.metalness = 0.0;
+    r.exposure = 1.0;
+    r.sunAngle = 0.0;
+    r.sliderDragStart = 0.0;
+    r.sliderId = -1;
     return r;
 }
 
 // =====================================================================
-// Gizmo Utility Functions
+// HSV Conversion
 // =====================================================================
+
+vec3 hsv2rgb(vec3 c) {
+    float h = c.x * 6.0, s = c.y, v = c.z;
+    float C = v * s;
+    float X = C * (1.0 - abs(mod(h, 2.0) - 1.0));
+    float m = v - C;
+    vec3 rgb = h < 1.0 ? vec3(C, X, 0.0) : h < 2.0 ? vec3(X, C, 0.0) :
+               h < 3.0 ? vec3(0.0, C, X) : h < 4.0 ? vec3(0.0, X, C) :
+               h < 5.0 ? vec3(X, 0.0, C) : vec3(C, 0.0, X);
+    return rgb + m;
+}
+
+vec3 rgb2hsv(vec3 c) {
+    float cmax = max(c.r, max(c.g, c.b));
+    float cmin = min(c.r, min(c.g, c.b));
+    float d = cmax - cmin;
+    float h = 0.0;
+    if (d > 0.0001) {
+        if (cmax == c.r) h = mod((c.g - c.b) / d, 6.0) / 6.0;
+        else if (cmax == c.g) h = ((c.b - c.r) / d + 2.0) / 6.0;
+        else h = ((c.r - c.g) / d + 4.0) / 6.0;
+    }
+    return vec3(h, cmax > 0.0001 ? d / cmax : 0.0, cmax);
+}
 
 float snap(float v, float s) { return round(v / s) * s; }
 vec3 snap3(vec3 v, float s) { return vec3(snap(v.x, s), snap(v.y, s), snap(v.z, s)); }
@@ -1131,4 +1177,496 @@ vec4 renderAxisIndicator(vec2 fc, vec3 camDir) {
         }
     }
     return r;
+}
+
+// =====================================================================
+// Number Rendering (bitmap digit font)
+// =====================================================================
+
+float sampleDigit(int n, vec2 uv) {
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return 0.0;
+    int font[10];
+    font[0]=0x75557; font[1]=0x22222; font[2]=0x74717; font[3]=0x74747; font[4]=0x11574;
+    font[5]=0x71747; font[6]=0x71757; font[7]=0x74444; font[8]=0x75757; font[9]=0x75747;
+    ivec2 ip = ivec2(floor(uv * vec2(4.0, 5.0)));
+    return float((font[n] >> (ip.x + ip.y * 4)) & 1);
+}
+
+// Render a signed float value. Returns alpha for digit pixels.
+float printFloat(vec2 p, float val, float charW, int decimals) {
+    bool neg = val < 0.0;
+    float av = abs(val);
+    int intPart = int(floor(av));
+    int numIntDigits = 1;
+    { int tmp = intPart; for (int i = 0; i < 6; i++) { tmp /= 10; if (tmp > 0) numIntDigits++; } }
+    int totalChars = (neg ? 1 : 0) + numIntDigits + 1 + decimals;
+    float cx = p.x / charW;
+    float cy = p.y / (charW * 1.4);
+    if (cy < 0.0 || cy >= 1.0 || cx < 0.0 || cx >= float(totalChars)) return 0.0;
+    int ci = int(floor(cx));
+    vec2 cuv = vec2(fract(cx), cy);
+    int pos = 0;
+    if (neg) {
+        if (ci == 0) {
+            if (cuv.y > 0.35 && cuv.y < 0.55 && cuv.x > 0.1 && cuv.x < 0.8) return 1.0;
+            return 0.0;
+        }
+        pos = 1;
+    }
+    if (ci >= pos && ci < pos + numIntDigits) {
+        int did = ci - pos;
+        int dv = intPart;
+        for (int i = 0; i < numIntDigits - 1 - did; i++) dv /= 10;
+        dv = dv - (dv / 10) * 10;
+        return sampleDigit(dv, cuv);
+    }
+    pos += numIntDigits;
+    if (ci == pos) {
+        if (cuv.x > 0.3 && cuv.x < 0.7 && cuv.y < 0.2) return 1.0;
+        return 0.0;
+    }
+    pos++;
+    if (ci >= pos && ci < pos + decimals) {
+        int did = ci - pos;
+        float frac = av - floor(av);
+        for (int i = 0; i <= did; i++) frac *= 10.0;
+        int dv = int(floor(frac)) - int(floor(frac / 10.0)) * 10;
+        return sampleDigit(dv, cuv);
+    }
+    return 0.0;
+}
+
+// =====================================================================
+// Bitmap Label Rendering
+// =====================================================================
+
+#define LBL_POS  0
+#define LBL_SIZ  1
+#define LBL_EXP  2
+#define LBL_SUN  3
+#define LBL_RGH  4
+#define LBL_MET  5
+#define LBL_X    6
+#define LBL_Y    7
+#define LBL_Z    8
+#define LBL_COL  9
+
+// 4x5 bitmap font for needed characters
+float charBitmap(int ch, vec2 uv) {
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return 0.0;
+    int x = int(uv.x * 4.0);
+    int y = int(uv.y * 5.0);
+    if (x > 3 || y > 4) return 0.0;
+    int pat = 0;
+    // P=0 o=1 s=2 S=3 i=4 z=5 E=6 x=7 p=8 R=9 g=10 h=11 M=12 e=13 t=14 C=15 l=16 u=17 n=18
+    if(ch== 0){int r[5];r[0]=0xE;r[1]=0x9;r[2]=0xE;r[3]=0x8;r[4]=0x8;pat=r[4-y];}
+    if(ch== 1){int r[5];r[0]=0x0;r[1]=0x6;r[2]=0x9;r[3]=0x9;r[4]=0x6;pat=r[4-y];}
+    if(ch== 2){int r[5];r[0]=0x0;r[1]=0x7;r[2]=0x8;r[3]=0x1;r[4]=0xE;pat=r[4-y];}
+    if(ch== 3){int r[5];r[0]=0x7;r[1]=0x8;r[2]=0x6;r[3]=0x1;r[4]=0xE;pat=r[4-y];}
+    if(ch== 4){int r[5];r[0]=0x4;r[1]=0x0;r[2]=0x4;r[3]=0x4;r[4]=0x4;pat=r[4-y];}
+    if(ch== 5){int r[5];r[0]=0x0;r[1]=0xF;r[2]=0x2;r[3]=0x4;r[4]=0xF;pat=r[4-y];}
+    if(ch== 6){int r[5];r[0]=0xF;r[1]=0x8;r[2]=0xE;r[3]=0x8;r[4]=0xF;pat=r[4-y];}
+    if(ch== 7){int r[5];r[0]=0x0;r[1]=0x9;r[2]=0x6;r[3]=0x6;r[4]=0x9;pat=r[4-y];}
+    if(ch== 8){int r[5];r[0]=0x0;r[1]=0xE;r[2]=0x9;r[3]=0xE;r[4]=0x8;pat=r[4-y];}
+    if(ch== 9){int r[5];r[0]=0xE;r[1]=0x9;r[2]=0xE;r[3]=0xA;r[4]=0x9;pat=r[4-y];}
+    if(ch==10){int r[5];r[0]=0x0;r[1]=0x7;r[2]=0x9;r[3]=0x7;r[4]=0x1;pat=r[4-y];}
+    if(ch==11){int r[5];r[0]=0x8;r[1]=0x8;r[2]=0xE;r[3]=0x9;r[4]=0x9;pat=r[4-y];}
+    if(ch==12){int r[5];r[0]=0x9;r[1]=0xF;r[2]=0xF;r[3]=0x9;r[4]=0x9;pat=r[4-y];}
+    if(ch==13){int r[5];r[0]=0x0;r[1]=0x6;r[2]=0x9;r[3]=0xF;r[4]=0x6;pat=r[4-y];}
+    if(ch==14){int r[5];r[0]=0x4;r[1]=0xE;r[2]=0x4;r[3]=0x4;r[4]=0x3;pat=r[4-y];}
+    if(ch==15){int r[5];r[0]=0x7;r[1]=0x8;r[2]=0x8;r[3]=0x8;r[4]=0x7;pat=r[4-y];}
+    if(ch==16){int r[5];r[0]=0x4;r[1]=0x4;r[2]=0x4;r[3]=0x4;r[4]=0x6;pat=r[4-y];}
+    if(ch==17){int r[5];r[0]=0x0;r[1]=0x9;r[2]=0x9;r[3]=0x9;r[4]=0x7;pat=r[4-y];}
+    if(ch==18){int r[5];r[0]=0x0;r[1]=0xE;r[2]=0x9;r[3]=0x9;r[4]=0x9;pat=r[4-y];}
+    return float((pat >> (3 - x)) & 1);
+}
+
+float drawLabel(vec2 p, float charW, int label) {
+    int c0=-1,c1=-1,c2=-1;
+    if(label==LBL_POS){c0=0;c1=1;c2=2;}
+    if(label==LBL_SIZ){c0=3;c1=4;c2=5;}
+    if(label==LBL_EXP){c0=6;c1=7;c2=8;}
+    if(label==LBL_SUN){c0=3;c1=17;c2=18;}
+    if(label==LBL_RGH){c0=9;c1=10;c2=11;}
+    if(label==LBL_MET){c0=12;c1=13;c2=14;}
+    if(label==LBL_X){c0=7;c1=-1;c2=-1;}
+    if(label==LBL_Y){return drawAxisChar(p/charW,1);}
+    if(label==LBL_Z){return drawAxisChar(p/charW,2);}
+    if(label==LBL_COL){c0=15;c1=1;c2=16;}
+    float a=0.0;
+    float cw=charW, ch=charW*1.25;
+    if(c0>=0) a=max(a,charBitmap(c0,vec2(p.x/cw,p.y/ch)));
+    if(c1>=0) a=max(a,charBitmap(c1,vec2((p.x-cw*1.1)/cw,p.y/ch)));
+    if(c2>=0) a=max(a,charBitmap(c2,vec2((p.x-cw*2.2)/cw,p.y/ch)));
+    return a;
+}
+
+// =====================================================================
+// Property Panel (right side)
+// =====================================================================
+
+#define PANEL_W        200.0
+#define PANEL_MARGIN   8.0
+#define PANEL_GAP      3.0
+#define PANEL_ROW_H    18.0
+#define PANEL_LABEL_W  32.0
+#define PANEL_CHAR_W   5.0
+#define PANEL_SECTION_H 22.0
+#define PANEL_CORNER_R 4.0
+
+#define SLIDER_NONE     -1
+#define SLIDER_EXPOSURE  0
+#define SLIDER_SUN       1
+#define SLIDER_ROUGHNESS 2
+#define SLIDER_METALNESS 3
+
+vec2 panelOrigin(vec2 res) {
+    return vec2(res.x - PANEL_W - PANEL_MARGIN, res.y - PANEL_MARGIN);
+}
+
+float panelHeight(bool hasSel) {
+    float h = PANEL_SECTION_H + 2.0 * PANEL_ROW_H + PANEL_GAP * 3.0;
+    if (hasSel) {
+        h += PANEL_SECTION_H + 3.0 * (PANEL_ROW_H + PANEL_GAP);
+        h += PANEL_SECTION_H + 3.0 * (PANEL_ROW_H + PANEL_GAP);
+        h += PANEL_SECTION_H + 2.0 * PANEL_ROW_H + PANEL_GAP * 3.0;
+    }
+    return h;
+}
+
+bool insidePanel(vec2 fc, vec2 res, bool hasSel) {
+    vec2 org = panelOrigin(res);
+    float ph = panelHeight(hasSel);
+    return fc.x >= org.x && fc.x <= org.x + PANEL_W &&
+           fc.y <= org.y && fc.y >= org.y - ph;
+}
+
+// ---- Slider ----
+
+struct SliderRect {
+    vec2 pos; vec2 size;
+    float minV, maxV, val;
+    int id;
+};
+
+SliderRect getSliderRect(int sid, vec2 org, float yOff, float val, float mn, float mx) {
+    SliderRect s;
+    float sx = org.x + PANEL_LABEL_W + PANEL_MARGIN + 2.0;
+    float sw = PANEL_W - PANEL_LABEL_W - PANEL_MARGIN * 3.0 - 2.0;
+    s.pos = vec2(sx + sw * 0.5, org.y - yOff);
+    s.size = vec2(sw * 0.5, PANEL_ROW_H * 0.5 - 2.0);
+    s.minV = mn; s.maxV = mx; s.val = val; s.id = sid;
+    return s;
+}
+
+int checkSliderClick(vec2 mp, SliderRect s) {
+    vec2 d = abs(mp - s.pos) - s.size;
+    return max(d.x, d.y) < 0.0 ? s.id : SLIDER_NONE;
+}
+
+float sliderDragValue(vec2 mp, SliderRect s) {
+    float t = clamp((mp.x - (s.pos.x - s.size.x)) / (s.size.x * 2.0), 0.0, 1.0);
+    return s.minV + t * (s.maxV - s.minV);
+}
+
+vec4 drawSlider(vec2 fc, SliderRect s) {
+    vec2 lp = fc - s.pos;
+    if (abs(lp.x) > s.size.x + 1.0 || abs(lp.y) > s.size.y + 1.0) return vec4(0.0);
+    float d = sdRoundBox2D(lp, s.size, 3.0);
+    if (d > 0.0) return vec4(0.0);
+    vec4 result = vec4(vec3(0.12, 0.12, 0.14), 1.0);
+    float t = clamp((s.val - s.minV) / (s.maxV - s.minV), 0.0, 1.0);
+    float fillX = -s.size.x + t * s.size.x * 2.0;
+    if (lp.x < fillX) result.rgb = UI_COL_ACCENT * 0.65;
+    float thumbD = abs(lp.x - fillX);
+    if (thumbD < 3.0 && abs(lp.y) < s.size.y) {
+        result.rgb = mix(result.rgb, vec3(0.95), smoothstep(3.0, 1.5, thumbD));
+    }
+    float edge = 1.0 - smoothstep(-1.5, 0.0, d);
+    result.rgb = mix(result.rgb, UI_COL_BORDER, edge * 0.5);
+    return result;
+}
+
+vec4 drawSectionHeader(vec2 fc, vec2 org, float yOff, int label) {
+    vec2 lp = fc - vec2(org.x + PANEL_MARGIN, org.y - yOff);
+    if (lp.x < 0.0 || lp.x > PANEL_W - PANEL_MARGIN * 2.0 ||
+        lp.y > 0.0 || lp.y < -PANEL_SECTION_H) return vec4(0.0);
+    vec4 result = vec4(0.0);
+    if (lp.y > -2.0) result = vec4(UI_COL_SEPARATOR, 0.8);
+    float la = drawLabel(vec2(lp.x, lp.y + PANEL_SECTION_H - 5.0), PANEL_CHAR_W, label);
+    if (la > 0.0) result = vec4(UI_COL_ICON * 1.2, 1.0);
+    return result;
+}
+
+vec4 drawValueRow(vec2 fc, vec2 org, float yOff, int label, float val) {
+    vec2 lp = fc - vec2(org.x + PANEL_MARGIN, org.y - yOff);
+    if (lp.x < 0.0 || lp.x > PANEL_W - PANEL_MARGIN * 2.0 ||
+        lp.y > 0.0 || lp.y < -PANEL_ROW_H) return vec4(0.0);
+    vec4 result = vec4(0.0);
+    float la = drawLabel(vec2(lp.x, lp.y + PANEL_ROW_H - 5.0), PANEL_CHAR_W, label);
+    if (la > 0.0) {
+        vec3 lc = UI_COL_ICON;
+        if(label==LBL_X) lc=AXIS_COLS[0];
+        if(label==LBL_Y) lc=AXIS_COLS[1];
+        if(label==LBL_Z) lc=AXIS_COLS[2];
+        result = vec4(lc, 1.0);
+    }
+    float na = printFloat(vec2(lp.x - PANEL_LABEL_W, lp.y + PANEL_ROW_H - 5.0), val, PANEL_CHAR_W, 2);
+    if (na > 0.0) result = vec4(vec3(0.82, 0.82, 0.84), 1.0);
+    return result;
+}
+
+vec4 drawSliderRow(vec2 fc, vec2 org, float yOff, int label, SliderRect s) {
+    vec4 result = vec4(0.0);
+    vec2 lp = fc - vec2(org.x + PANEL_MARGIN, org.y - yOff);
+    if (lp.x >= 0.0 && lp.x < PANEL_LABEL_W && lp.y <= 0.0 && lp.y >= -PANEL_ROW_H) {
+        float la = drawLabel(vec2(lp.x, lp.y + PANEL_ROW_H - 5.0), PANEL_CHAR_W, label);
+        if (la > 0.0) result = vec4(UI_COL_ICON, 1.0);
+    }
+    vec4 sl = drawSlider(fc, s);
+    if (sl.a > result.a) result = sl;
+    float numP = printFloat(vec2(fc.x - (s.pos.x + s.size.x + 4.0), fc.y - (s.pos.y - 3.5)), s.val, PANEL_CHAR_W - 1.0, 2);
+    if (numP > 0.0) result = vec4(vec3(0.72), 1.0);
+    return result;
+}
+
+// ---- Full panel ----
+
+vec4 renderPropertyPanel(vec2 fc, vec2 res, int selId, float transMode,
+                         vec3 objPos, vec3 objSiz, float exposure, float sunAngle,
+                         float roughness, float metalness) {
+    bool hasSel = (selId >= 0);
+    vec2 org = panelOrigin(res);
+    float ph = panelHeight(hasSel);
+    if (fc.x < org.x - 2.0 || fc.x > org.x + PANEL_W + 2.0 ||
+        fc.y > org.y + 2.0 || fc.y < org.y - ph - 2.0) return vec4(0.0);
+
+    vec2 pc = vec2(org.x + PANEL_W * 0.5, org.y - ph * 0.5);
+    float bgD = sdRoundBox2D(fc - pc, vec2(PANEL_W * 0.5, ph * 0.5), PANEL_CORNER_R);
+    vec4 result = vec4(0.0);
+    if (bgD < 0.0) {
+        float edge = 1.0 - smoothstep(-2.0, 0.0, bgD);
+        result = vec4(mix(UI_COL_PANEL, UI_COL_BORDER, edge * 0.5), 0.92);
+    } else return vec4(0.0);
+
+    float y = PANEL_GAP;
+
+    // Scene section
+    vec4 hdr = drawSectionHeader(fc, org, y, LBL_EXP);
+    if(hdr.a>0.005){result.rgb=mix(result.rgb,hdr.rgb,hdr.a);result.a=max(result.a,hdr.a);}
+    y += PANEL_SECTION_H;
+
+    SliderRect sExp = getSliderRect(SLIDER_EXPOSURE, org, y + PANEL_ROW_H*0.5, exposure, 0.1, 5.0);
+    vec4 sr = drawSliderRow(fc, org, y, LBL_EXP, sExp);
+    if(sr.a>0.005){result.rgb=mix(result.rgb,sr.rgb,sr.a);result.a=max(result.a,sr.a);}
+    y += PANEL_ROW_H + PANEL_GAP;
+
+    SliderRect sSun = getSliderRect(SLIDER_SUN, org, y + PANEL_ROW_H*0.5, sunAngle, 0.0, 6.283);
+    sr = drawSliderRow(fc, org, y, LBL_SUN, sSun);
+    if(sr.a>0.005){result.rgb=mix(result.rgb,sr.rgb,sr.a);result.a=max(result.a,sr.a);}
+    y += PANEL_ROW_H + PANEL_GAP;
+
+    if (hasSel) {
+        // Position
+        hdr = drawSectionHeader(fc, org, y, LBL_POS);
+        if(hdr.a>0.005){result.rgb=mix(result.rgb,hdr.rgb,hdr.a);result.a=max(result.a,hdr.a);}
+        y += PANEL_SECTION_H;
+        for (int i = 0; i < 3; i++) {
+            float v=(i==0)?objPos.x:(i==1?objPos.y:objPos.z);
+            vec4 vr = drawValueRow(fc, org, y, LBL_X+i, v);
+            if(vr.a>0.005){result.rgb=mix(result.rgb,vr.rgb,vr.a);result.a=max(result.a,vr.a);}
+            y += PANEL_ROW_H + PANEL_GAP;
+        }
+        // Size
+        hdr = drawSectionHeader(fc, org, y, LBL_SIZ);
+        if(hdr.a>0.005){result.rgb=mix(result.rgb,hdr.rgb,hdr.a);result.a=max(result.a,hdr.a);}
+        y += PANEL_SECTION_H;
+        for (int i = 0; i < 3; i++) {
+            float v=(i==0)?objSiz.x:(i==1?objSiz.y:objSiz.z);
+            vec4 vr = drawValueRow(fc, org, y, LBL_X+i, v);
+            if(vr.a>0.005){result.rgb=mix(result.rgb,vr.rgb,vr.a);result.a=max(result.a,vr.a);}
+            y += PANEL_ROW_H + PANEL_GAP;
+        }
+        // Material
+        hdr = drawSectionHeader(fc, org, y, LBL_COL);
+        if(hdr.a>0.005){result.rgb=mix(result.rgb,hdr.rgb,hdr.a);result.a=max(result.a,hdr.a);}
+        y += PANEL_SECTION_H;
+        SliderRect sRgh = getSliderRect(SLIDER_ROUGHNESS, org, y+PANEL_ROW_H*0.5, roughness, 0.05, 1.0);
+        sr = drawSliderRow(fc, org, y, LBL_RGH, sRgh);
+        if(sr.a>0.005){result.rgb=mix(result.rgb,sr.rgb,sr.a);result.a=max(result.a,sr.a);}
+        y += PANEL_ROW_H + PANEL_GAP;
+        SliderRect sMet = getSliderRect(SLIDER_METALNESS, org, y+PANEL_ROW_H*0.5, metalness, 0.0, 1.0);
+        sr = drawSliderRow(fc, org, y, LBL_MET, sMet);
+        if(sr.a>0.005){result.rgb=mix(result.rgb,sr.rgb,sr.a);result.a=max(result.a,sr.a);}
+    }
+    return result;
+}
+
+int checkPanelSliderClick(vec2 mp, vec2 res, int selId,
+                          float exposure, float sunAngle, float roughness, float metalness) {
+    bool hasSel = (selId >= 0);
+    vec2 org = panelOrigin(res);
+    float y = PANEL_GAP + PANEL_SECTION_H;
+    SliderRect sExp = getSliderRect(SLIDER_EXPOSURE, org, y+PANEL_ROW_H*0.5, exposure, 0.1, 5.0);
+    if(checkSliderClick(mp,sExp)!=SLIDER_NONE) return SLIDER_EXPOSURE;
+    y += PANEL_ROW_H + PANEL_GAP;
+    SliderRect sSun = getSliderRect(SLIDER_SUN, org, y+PANEL_ROW_H*0.5, sunAngle, 0.0, 6.283);
+    if(checkSliderClick(mp,sSun)!=SLIDER_NONE) return SLIDER_SUN;
+    y += PANEL_ROW_H + PANEL_GAP;
+    if (hasSel) {
+        y += PANEL_SECTION_H + 3.0*(PANEL_ROW_H+PANEL_GAP);
+        y += PANEL_SECTION_H + 3.0*(PANEL_ROW_H+PANEL_GAP);
+        y += PANEL_SECTION_H;
+        SliderRect sRgh = getSliderRect(SLIDER_ROUGHNESS, org, y+PANEL_ROW_H*0.5, roughness, 0.05, 1.0);
+        if(checkSliderClick(mp,sRgh)!=SLIDER_NONE) return SLIDER_ROUGHNESS;
+        y += PANEL_ROW_H + PANEL_GAP;
+        SliderRect sMet = getSliderRect(SLIDER_METALNESS, org, y+PANEL_ROW_H*0.5, metalness, 0.0, 1.0);
+        if(checkSliderClick(mp,sMet)!=SLIDER_NONE) return SLIDER_METALNESS;
+    }
+    return SLIDER_NONE;
+}
+
+SliderRect getSliderById(int sid, vec2 res, int selId,
+                         float exposure, float sunAngle, float roughness, float metalness) {
+    vec2 org = panelOrigin(res);
+    float y = PANEL_GAP + PANEL_SECTION_H;
+    if(sid==SLIDER_EXPOSURE) return getSliderRect(sid,org,y+PANEL_ROW_H*0.5,exposure,0.1,5.0);
+    y += PANEL_ROW_H + PANEL_GAP;
+    if(sid==SLIDER_SUN) return getSliderRect(sid,org,y+PANEL_ROW_H*0.5,sunAngle,0.0,6.283);
+    if(selId>=0) {
+        y += PANEL_ROW_H + PANEL_GAP;
+        y += PANEL_SECTION_H + 3.0*(PANEL_ROW_H+PANEL_GAP);
+        y += PANEL_SECTION_H + 3.0*(PANEL_ROW_H+PANEL_GAP);
+        y += PANEL_SECTION_H;
+        if(sid==SLIDER_ROUGHNESS) return getSliderRect(sid,org,y+PANEL_ROW_H*0.5,roughness,0.05,1.0);
+        y += PANEL_ROW_H + PANEL_GAP;
+        if(sid==SLIDER_METALNESS) return getSliderRect(sid,org,y+PANEL_ROW_H*0.5,metalness,0.0,1.0);
+    }
+    return getSliderRect(-1, org, 0.0, 0.0, 0.0, 1.0);
+}
+
+// =====================================================================
+// HSV Color Picker (MagicaCSG style)
+// =====================================================================
+
+#define PICKER_SV_SIZE 120.0
+#define PICKER_H_WIDTH 16.0
+#define PICKER_GAP_C 6.0
+#define PICKER_MARGIN_C 8.0
+
+vec2 pickerOrigin(vec2 res) {
+    float tbH = toolbarHeight();
+    return vec2(PICKER_MARGIN_C, res.y - tbH - UI_TOP_PAD - PICKER_MARGIN_C - PICKER_SV_SIZE);
+}
+
+int checkPickerClick(vec2 mp, vec2 res) {
+    vec2 org = pickerOrigin(res);
+    vec2 p = mp - org;
+    if(p.x>=0.0&&p.x<=PICKER_SV_SIZE&&p.y>=0.0&&p.y<=PICKER_SV_SIZE) return 1;
+    float hst = PICKER_SV_SIZE + PICKER_GAP_C;
+    if(p.x>=hst&&p.x<=hst+PICKER_H_WIDTH&&p.y>=0.0&&p.y<=PICKER_SV_SIZE) return 2;
+    return 0;
+}
+
+vec3 getPickerHSV(vec2 mp, vec2 res, vec3 cur, float mode) {
+    vec2 org = pickerOrigin(res);
+    vec2 p = mp - org;
+    vec3 hsv = cur;
+    if(mode==MODE_PICKER_SV){hsv.y=clamp(p.x/PICKER_SV_SIZE,0.0,1.0);hsv.z=clamp(p.y/PICKER_SV_SIZE,0.0,1.0);}
+    else if(mode==MODE_PICKER_H){hsv.x=clamp(p.y/PICKER_SV_SIZE,0.0,1.0);}
+    return hsv;
+}
+
+bool insidePicker(vec2 fc, vec2 res) {
+    vec2 org = pickerOrigin(res);
+    float tw = PICKER_SV_SIZE + PICKER_GAP_C + PICKER_H_WIDTH;
+    vec2 p = fc - org;
+    return p.x >= -PICKER_MARGIN_C && p.x <= tw + PICKER_MARGIN_C &&
+           p.y >= -PICKER_MARGIN_C - 14.0 && p.y <= PICKER_SV_SIZE + PICKER_MARGIN_C;
+}
+
+vec4 renderPicker(vec2 fc, vec2 res, vec3 hsv, bool show) {
+    if (!show) return vec4(0.0);
+    vec2 org = pickerOrigin(res);
+    float tw = PICKER_SV_SIZE + PICKER_GAP_C + PICKER_H_WIDTH;
+    vec2 p = fc - org;
+    if(p.x<-PICKER_MARGIN_C-2.0||p.x>tw+PICKER_MARGIN_C+2.0||
+       p.y<-PICKER_MARGIN_C-14.0||p.y>PICKER_SV_SIZE+PICKER_MARGIN_C+2.0)
+        return vec4(0.0);
+
+    vec4 r = vec4(0.0);
+    vec2 bgC = vec2(tw*0.5, PICKER_SV_SIZE*0.5);
+    float bgD = sdRoundBox2D(p-bgC, vec2(tw*0.5+PICKER_MARGIN_C, PICKER_SV_SIZE*0.5+PICKER_MARGIN_C), PANEL_CORNER_R);
+    if(bgD<0.0){float e=1.0-smoothstep(-2.0,0.0,bgD);r=vec4(mix(UI_COL_PANEL,UI_COL_BORDER,e*0.5),0.92);}
+
+    // SV square
+    if(p.x>=0.0&&p.x<=PICKER_SV_SIZE&&p.y>=0.0&&p.y<=PICKER_SV_SIZE){
+        vec2 sv=clamp(p/PICKER_SV_SIZE,0.0,1.0);
+        r=vec4(hsv2rgb(vec3(hsv.x,sv.x,sv.y)),1.0);
+        float bd=sdBox2D(p-vec2(PICKER_SV_SIZE*0.5),vec2(PICKER_SV_SIZE*0.5));
+        if(bd>-1.0) r.rgb=mix(r.rgb,UI_COL_BORDER,smoothstep(-1.0,0.0,bd));
+    }
+    // SV cursor
+    vec2 svm=vec2(hsv.y,hsv.z)*PICKER_SV_SIZE;
+    float svD=length(p-svm);
+    if(svD<5.0){
+        float ring=smoothstep(5.0,3.5,svD)-smoothstep(3.5,2.0,svD);
+        r=vec4(mix(r.rgb,vec3(1.0),ring*0.9),max(r.a,ring));
+        if(svD<2.0) r=vec4(hsv2rgb(hsv),1.0);
+    }
+    // Hue bar
+    float hst=PICKER_SV_SIZE+PICKER_GAP_C;
+    if(p.x>=hst&&p.x<=hst+PICKER_H_WIDTH&&p.y>=0.0&&p.y<=PICKER_SV_SIZE){
+        float hc=clamp(p.y/PICKER_SV_SIZE,0.0,1.0);
+        r=vec4(hsv2rgb(vec3(hc,1.0,1.0)),1.0);
+        float hbd=sdBox2D(p-vec2(hst+PICKER_H_WIDTH*0.5,PICKER_SV_SIZE*0.5),vec2(PICKER_H_WIDTH*0.5,PICKER_SV_SIZE*0.5));
+        if(hbd>-1.0) r.rgb=mix(r.rgb,UI_COL_BORDER,smoothstep(-1.0,0.0,hbd));
+    }
+    // Hue cursor
+    float hmy=hsv.x*PICKER_SV_SIZE;
+    if(abs(p.y-hmy)<2.5&&p.x>=hst-3.0&&p.x<=hst+PICKER_H_WIDTH+3.0){
+        float hy=1.0-smoothstep(1.0,2.5,abs(p.y-hmy));
+        bool ib=(p.x>=hst&&p.x<=hst+PICKER_H_WIDTH);
+        if(!ib)r=vec4(mix(r.rgb,vec3(1.0),hy*0.9),max(r.a,hy));
+        else r.rgb=mix(r.rgb,vec3(1.0),hy*0.3);
+    }
+    // Color preview swatch
+    vec2 pvPos=vec2(PICKER_SV_SIZE*0.5,-PICKER_MARGIN_C*0.5);
+    float pvD=sdRoundBox2D(p-pvPos,vec2(PICKER_SV_SIZE*0.5,4.0),2.0);
+    if(pvD<0.0){r=vec4(hsv2rgb(hsv),1.0);if(pvD>-1.0)r.rgb=mix(r.rgb,UI_COL_BORDER,smoothstep(-1.0,0.0,pvD));}
+
+    return r;
+}
+
+// =====================================================================
+// Material Preview Sphere
+// =====================================================================
+
+vec4 renderMatPreview(vec2 fc, vec2 res, vec3 albedo, float roughness, float metalness) {
+    vec2 org = pickerOrigin(res);
+    float cy = org.y - PICKER_MARGIN_C - 20.0;
+    float cx = org.x + PICKER_SV_SIZE * 0.5;
+    float radius = 16.0;
+    vec2 p = fc - vec2(cx, cy);
+    float d = length(p);
+    if (d > radius + 1.0) return vec4(0.0);
+    vec3 n = vec3(p / radius, sqrt(max(0.0, 1.0 - dot(p,p) / (radius*radius))));
+    if (d > radius) return vec4(0.0);
+    vec3 ld = normalize(vec3(0.5, 0.8, -0.5));
+    float ndl = max(dot(n, ld), 0.0);
+    vec3 vd = vec3(0.0, 0.0, 1.0);
+    vec3 h = normalize(ld + vd);
+    float ndh = max(dot(n, h), 0.0);
+    float ndv = max(dot(n, vd), 0.0);
+    float r2 = roughness * roughness;
+    float spec = pow(ndh, mix(256.0, 4.0, r2));
+    vec3 F0 = mix(vec3(0.04), albedo, metalness);
+    vec3 F = F0 + (1.0 - F0) * pow(1.0 - ndv, 5.0);
+    vec3 kD = (1.0 - F) * (1.0 - metalness);
+    vec3 ambient = vec3(0.15) * albedo;
+    vec3 col = ambient + kD * albedo * ndl + F * spec;
+    col = col / (col + vec3(1.0));
+    col = pow(col, vec3(INV_GAMMA));
+    float aa = smoothstep(radius, radius - 1.0, d);
+    return vec4(col, aa);
 }
