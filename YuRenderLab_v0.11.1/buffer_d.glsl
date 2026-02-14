@@ -4,10 +4,156 @@
 #include "common.glsl"
 
 //=============================================================================
+// Scene picking (analytical intersection for object selection)
+//=============================================================================
+
+int pickSceneObject(Ray r, sampler2D buf) {
+    float bestT = INF;
+    int bestId = -1;
+
+    // Test sphere
+    vec3 spherePos = ld(buf, 0, ROW_OBJECTS).xyz;
+    float ts;
+    if (intersectSphere(r, spherePos, SPHERE_RADIUS, ts) && ts < bestT) {
+        bestT = ts;
+        bestId = OBJ_SPHERE_ID;
+    }
+
+    // Test tall box (rotated)
+    vec3 tallboxPos = ld(buf, 1, ROW_OBJECTS).xyz;
+    vec3 localRo = r.ro - tallboxPos;
+    vec3 localRd = r.rd;
+    float cRot = cos(TALLBOX_ROT_ANGLE), sRot = sin(TALLBOX_ROT_ANGLE);
+    localRo.xz = mat2(cRot, sRot, -sRot, cRot) * localRo.xz;
+    localRd.xz = mat2(cRot, sRot, -sRot, cRot) * localRd.xz;
+    float tb;
+    if (intersectBox(Ray(localRo, localRd), vec3(0.0), TALLBOX_HALFSIZE, tb) && tb < bestT) {
+        bestT = tb;
+        bestId = OBJ_TALLBOX_ID;
+    }
+
+    return bestId;
+}
+
+//=============================================================================
+// Gizmo 交互处理
+//=============================================================================
+
+bool procGizmoInp(InpState inp, vec2 res, int selId, float md, float transMode, int actPart,
+                  vec3 camPos, vec3 camDir, vec2 dragStart, sampler2D buf, inout IxResult r) {
+    if (selId < 0) return false;
+
+    vec3 objPos = ld(buf, selId, ROW_OBJECTS).xyz;
+    float gsc = gizmoScl(objPos, camPos);
+
+    // Currently dragging
+    if (md == MODE_TRANSFORM) {
+        if (inp.mdown) {
+            Ray curRay = createPickRay(inp.mpos, res, camPos, camDir);
+
+            vec3 dVal = ld(buf, 0, ROW_DRAG).xyz;
+            vec3 dPlane = ld(buf, 1, ROW_DRAG).xyz;
+
+            r.flags = r.flags | CHG_OBJECT;
+            r.targetId = selId;
+
+            // Translation logic
+            vec3 newPos;
+            if (actPart == PART_CENTER || actPart == PART_NONE) {
+                // Move along camera view plane
+                newPos = dVal + rayPlane(camPos, curRay.rd, dPlane, -camDir) - dPlane;
+            } else {
+                // Move along single axis
+                vec3 ax = axisVec(actPart - PART_X);
+                Ray startRay = createPickRay(dragStart, res, camPos, camDir);
+                newPos = dVal + ax * dot(
+                    projectAxis(curRay, dPlane, ax, camDir) -
+                    projectAxis(startRay, dPlane, ax, camDir), ax);
+            }
+            r.objPos = inp.kctrl ? snap3(newPos, TF_SNAP_TRANS) : newPos;
+            return true;
+        }
+        return false;
+    }
+
+    // Try to pick gizmo on mouse press
+    if (inp.mpressed && !inp.kshift) {
+        Ray pickRay = createPickRay(inp.mpos, res, camPos, camDir);
+
+        float hitT;
+        int hitPart = pickGizmo(pickRay, objPos, gsc, hitT);
+
+        if (hitPart != PART_NONE) {
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG;
+
+            r.selId = selId;
+            r.imode = MODE_TRANSFORM;
+            r.transMode = transMode;
+            r.actPart = hitPart;
+
+            r.dragStart = inp.mpos;
+            r.camPos = camPos;
+            r.camDir = camDir;
+            r.angles = ld(buf, 1, ROW_CAMERA).xy;
+            r.dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+
+            r.dragPlane = objPos;
+            r.dragVal = objPos;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool procSceneInp(InpState inp, vec2 res, int selId, float transMode,
+                  vec3 camPos, vec3 camDir, sampler2D buf, inout IxResult r) {
+    if (!inp.mpressed) return false;
+    if (inp.kshift) return false;
+
+    Ray pickRay = createPickRay(inp.mpos, res, camPos, camDir);
+    int hitId = pickSceneObject(pickRay, buf);
+
+    if (hitId >= 0) {
+        if (hitId == selId) {
+            // Click on already selected object → start center drag
+            vec3 objPos = ld(buf, selId, ROW_OBJECTS).xyz;
+
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG;
+            r.selId = selId;
+            r.imode = MODE_TRANSFORM;
+            r.transMode = transMode;
+            r.actPart = PART_CENTER;
+
+            r.dragStart = inp.mpos;
+            r.camPos = camPos;
+            r.camDir = camDir;
+            r.angles = ld(buf, 1, ROW_CAMERA).xy;
+            r.dragAngles = ld(buf, 1, ROW_CAMERA).zw;
+
+            r.dragPlane = objPos;
+            r.dragVal = objPos;
+        } else {
+            // Select new object
+            r.flags = r.flags | CHG_SELECTION;
+            r.selId = hitId;
+            r.imode = MODE_NONE;
+            r.transMode = transMode;
+            r.actPart = PART_NONE;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+//=============================================================================
 // 相机交互处理
 //=============================================================================
 
-void procCameraInp(InpState inp, vec2 res, float md, vec2 angles, vec2 dragAngles, vec2 dragStart,
+void procCameraInp(InpState inp, vec2 res, int selId, float md, float transMode,
+                   vec2 angles, vec2 dragAngles, vec2 dragStart,
                    vec3 camPos, vec3 camDir, sampler2D kb, sampler2D buf, inout IxResult r) {
 
     // 当前处于相机旋转模式
@@ -28,10 +174,13 @@ void procCameraInp(InpState inp, vec2 res, float md, vec2 angles, vec2 dragAngle
         return;
     }
 
-    // 按下鼠标开始相机旋转
+    // 按下鼠标 → 取消选择 + 开始相机旋转
     if (inp.mpressed) {
         r.flags = r.flags | CHG_SELECTION | CHG_CAMERA;
+        r.selId = -1;
         r.imode = MODE_CAMERA;
+        r.transMode = transMode;
+        r.actPart = PART_NONE;
         r.dragStart = inp.mpos;
         r.dragAngles = angles;
         r.camPos = camPos;
@@ -43,16 +192,16 @@ void procCameraInp(InpState inp, vec2 res, float md, vec2 angles, vec2 dragAngle
 void procCameraMove(InpState inp, vec3 camPos, vec3 camDir, vec2 angles, sampler2D kb, sampler2D buf, inout IxResult r) {
     float spd = CAM_SPEED;
     if (inp.kshift) spd *= CAM_SPRINT;
-    
+
     vec3 fwd = normalize(camDir);
     vec3 rt = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
     if (length(cross(fwd, vec3(0.0, 1.0, 0.0))) < 0.001) {
         rt = vec3(1.0, 0.0, 0.0);
     }
-    
+
     vec3 newPos = camPos;
     bool moved = false;
-    
+
     if (keyDown(kb, KEY_W)) { newPos = newPos + fwd * spd; moved = true; }
     if (keyDown(kb, KEY_S)) { newPos = newPos - fwd * spd; moved = true; }
     if (keyDown(kb, KEY_A)) { newPos = newPos - rt * spd; moved = true; }
@@ -83,7 +232,10 @@ IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampl
     vec3 camPos = ld(buf, 3, ROW_CAMERA).xyz;
     vec4 stateData = ld(buf, 0, ROW_STATE);
 
-    float md = stateData.x;  // interaction mode
+    float md = stateData.x;     // interaction mode
+    int selId = int(stateData.y);  // selected object ID
+    float transMode = stateData.z; // transform mode
+    int actPart = int(stateData.w); // active gizmo part
     vec2 angles = anglesData.xy;
     vec2 dragAngles = anglesData.zw;
     vec2 dragStart = mouseState.xy;
@@ -94,12 +246,12 @@ IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampl
 
     // 键盘移动相机
     procCameraMove(inp, camPos, camDir, angles, kb, buf, r);
-    
+
     if ((r.flags & CHG_CAMERA) != 0u) {
         camPos = r.camPos;
     }
 
-    // 鼠标释放时退出旋转模式
+    // 鼠标释放时退出当前模式（保持选择）
     if (inp.mreleased) {
         if (md == MODE_CAMERA) {
             r.flags = r.flags | CHG_CAMERA;
@@ -110,12 +262,17 @@ IxResult processInteraction(InpState inp, vec4 mouse, vec2 res, int frame, sampl
             r.dragAngles = angles;
         }
         r.flags = r.flags | CHG_SELECTION;
+        r.selId = selId;        // keep selection
         r.imode = MODE_NONE;
+        r.transMode = transMode; // keep transform mode
+        r.actPart = PART_NONE;  // clear active part
         return r;
     }
 
-    // 相机旋转交互
-    procCameraInp(inp, res, md, angles, dragAngles, dragStart, camPos, camDir, kb, buf, r);
+    // 分层交互优先级：Gizmo > 场景选择 > 相机
+    if (procGizmoInp(inp, res, selId, md, transMode, actPart, camPos, camDir, dragStart, buf, r)) return r;
+    if (procSceneInp(inp, res, selId, transMode, camPos, camDir, buf, r)) return r;
+    procCameraInp(inp, res, selId, md, transMode, angles, dragAngles, dragStart, camPos, camDir, kb, buf, r);
 
     return r;
 }
@@ -132,7 +289,15 @@ vec4 initState(ivec2 px, vec2 res) {
         if (px.x == 3) return vec4(CAM_INIT_POS, 0.0);
     }
     if (px.y == ROW_STATE && px.x == 0) {
-        return vec4(MODE_NONE, 0.0, 0.0, 0.0);
+        // vec4(imode, selId, transMode, actPart)
+        return vec4(MODE_NONE, -1.0, TRANS_TRANSLATE, float(PART_NONE));
+    }
+    if (px.y == ROW_OBJECTS) {
+        if (px.x == OBJ_SPHERE_ID) return vec4(SPHERE_INIT_POS, 0.0);
+        if (px.x == OBJ_TALLBOX_ID) return vec4(TALLBOX_INIT_POS, 0.0);
+    }
+    if (px.y == ROW_DRAG) {
+        return vec4(0.0);
     }
     return vec4(0.0);
 }
@@ -170,9 +335,24 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf) {
 
     if (px.y == ROW_STATE && px.x == 0) {
         if ((r.flags & CHG_SELECTION) != 0u) {
-            return vec4(r.imode, 0.0, 0.0, 0.0);
+            return vec4(r.imode, float(r.selId), r.transMode, float(r.actPart));
         }
         return ld(buf, 0, ROW_STATE);
+    }
+
+    if (px.y == ROW_OBJECTS) {
+        if ((r.flags & CHG_OBJECT) != 0u && r.targetId >= 0 && px.x == r.targetId) {
+            return vec4(r.objPos, 0.0);
+        }
+        return ld(buf, px.x, ROW_OBJECTS);
+    }
+
+    if (px.y == ROW_DRAG) {
+        if ((r.flags & CHG_DRAG) != 0u) {
+            if (px.x == 0) return vec4(r.dragVal, 0.0);
+            if (px.x == 1) return vec4(r.dragPlane, 0.0);
+        }
+        return ld(buf, px.x, ROW_DRAG);
     }
 
     return vec4(0.0);
@@ -185,9 +365,9 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf) {
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     ivec2 px = ivec2(fragCoord);
     vec2 res = iResolution.xy;
-    
+
     // 只处理相关行
-    if (px.y > ROW_KEYS) {
+    if (px.y > ROW_DRAG) {
         fragColor = vec4(0.0);
         return;
     }

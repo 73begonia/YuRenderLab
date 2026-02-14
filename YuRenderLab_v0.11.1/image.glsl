@@ -8,6 +8,10 @@
 #iChannel2 "file://buffer_b.glsl"
 #include "common.glsl"
 
+// Dynamic object positions (set in mainImage, read in sceneSDF)
+vec3 g_spherePos;
+vec3 g_tallboxPos;
+
 // PBR + IBL rendering of a Cornell box scene.
 // No direct lights, no shadows, no normal maps.
 // Diffuse IBL via spherical harmonics (BufferA).
@@ -94,20 +98,18 @@ SceneHit sceneSDF(vec3 p)
               vec3(WALL_THICK * 0.5, 2.5 + WALL_THICK, 2.5 + WALL_THICK));
     h = opUnion(h, SceneHit(d, MAT_RIGHT));
 
-    // Sphere
+    // Sphere (dynamic position from Buffer D)
     {
-        vec3 center = vec3(-0.8, 0.75, 1.8);
-        d = sdSphere(p - center, 0.75);
+        d = sdSphere(p - g_spherePos, SPHERE_RADIUS);
         h = opUnion(h, SceneHit(d, MAT_SPHERE));
     }
 
-    // Tall box (rotated ~-18 deg around Y)
+    // Tall box (dynamic position, fixed rotation)
     {
-        vec3 center = vec3(0.9, 1.5, 3.2);
-        vec3 q = p - center;
-        float c = cos(-0.30), s = sin(-0.30);
+        vec3 q = p - g_tallboxPos;
+        float c = cos(TALLBOX_ROT_ANGLE), s = sin(TALLBOX_ROT_ANGLE);
         q.xz = mat2(c, s, -s, c) * q.xz;
-        d = sdBox(q, vec3(0.7, 1.5, 0.7));
+        d = sdBox(q, TALLBOX_HALFSIZE);
         h = opUnion(h, SceneHit(d, MAT_TALL));
     }
 
@@ -287,6 +289,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec3 camDir = ld(iChannel0, 2, ROW_CAMERA).xyz;
     if (length(camDir) < 0.001) camDir = vec3(0.0, 0.0, 1.0);
 
+    // Load dynamic object positions (fallback to defaults on first frame)
+    g_spherePos = ld(iChannel0, OBJ_SPHERE_ID, ROW_OBJECTS).xyz;
+    g_tallboxPos = ld(iChannel0, OBJ_TALLBOX_ID, ROW_OBJECTS).xyz;
+    if (length(g_spherePos) < 0.001 && length(g_tallboxPos) < 0.001) {
+        g_spherePos = SPHERE_INIT_POS;
+        g_tallboxPos = TALLBOX_INIT_POS;
+    }
+
     vec3 rd = rayDirection(CAM_FOV, fragCoord);
     vec3 up = vec3(0.0, 1.0, 0.0);
     mat3 viewMatrix = lookAt(camPos, camPos + camDir, up);
@@ -342,6 +352,26 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     }
 
     col = gamma(col);
-    
+
+    // ---- Gizmo overlay (post-tonemap) ----
+    vec4 stateData = ld(iChannel0, 0, ROW_STATE);
+    int selId = int(stateData.y);
+    int actPart = int(stateData.w);
+
+    if (selId >= 0 && selId < OBJ_COUNT) {
+        vec3 objPos = ld(iChannel0, selId, ROW_OBJECTS).xyz;
+        float pxScalar = 1.0 / iResolution.y;
+
+        Ray gizmoRay = Ray(camPos, rd);
+        GizmoHit gh = traceGizmo(gizmoRay, objPos, camPos, actPart, pxScalar);
+
+        if (gh.t < INF) {
+            bool occluded = (t < MAX_DIST && t < gh.t);
+            float alpha = occluded ? gh.alpha * 0.2 : gh.alpha;
+            vec3 gc = occluded ? gh.col * GZ_OCCLUDED_BRIGHT : gh.col;
+            col = mix(col, gc, alpha);
+        }
+    }
+
     fragColor = vec4(col, 1.0);
 }
