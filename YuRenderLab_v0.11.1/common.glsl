@@ -82,6 +82,10 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define ROW_ROTATIONS 5
 #define ROW_SIZES 6
 #define ROW_DRAG_ROT 7
+#define ROW_UNDO 8
+#define ROW_UNDO_ROT 9
+#define ROW_CLIPBOARD 10
+#define ROW_CLIP_ROT 11
 
 // ----------------------- Interaction modes -----------------------
 
@@ -99,6 +103,9 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define KEY_E 69
 #define KEY_R 82
 #define KEY_F 70
+#define KEY_Z 90
+#define KEY_C 67
+#define KEY_V 86
 #define KEY_SPACE 32
 #define KEY_CTRL 17
 #define KEY_SHIFT 16
@@ -111,6 +118,9 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define CHG_SELECTION 2u
 #define CHG_OBJECT 4u
 #define CHG_DRAG 8u
+#define CHG_UNDO 16u
+#define CHG_UNDO_EXEC 32u
+#define CHG_CLIPBOARD 64u
 
 // ----------------------- Helper functions -----------------------
 
@@ -313,6 +323,14 @@ struct IxResult {
     vec4 dragQuat;
     vec4 objQuat;
     vec3 objSiz;
+    // Undo fields
+    vec3 undoPos;
+    vec3 undoSiz;
+    vec4 undoQuat;
+    // Clipboard fields
+    vec3 clipPos;
+    vec3 clipSiz;
+    vec4 clipQuat;
 };
 
 IxResult initIxResult() {
@@ -335,6 +353,12 @@ IxResult initIxResult() {
     r.dragQuat = quatId();
     r.objQuat = quatId();
     r.objSiz = vec3(1.0);
+    r.undoPos = vec3(0.0);
+    r.undoSiz = vec3(0.0);
+    r.undoQuat = quatId();
+    r.clipPos = vec3(0.0);
+    r.clipSiz = vec3(0.0);
+    r.clipQuat = quatId();
     return r;
 }
 

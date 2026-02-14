@@ -132,7 +132,7 @@ bool procGizmoInp(InpState inp, vec2 res, int selId, float md, float transMode, 
         int hitPart = pickGizmoFull(pickRay, objPos, camPos, gsc, transMode, actPart, objQuat, hitT);
 
         if (hitPart != PART_NONE) {
-            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG;
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG | CHG_UNDO;
 
             r.selId = selId;
             r.imode = MODE_TRANSFORM;
@@ -152,6 +152,12 @@ bool procGizmoInp(InpState inp, vec2 res, int selId, float md, float transMode, 
             if (transMode == TRANS_ROTATE && hitPart >= PART_X) {
                 r.dragAngle = calcRotAngle(pickRay.ro, pickRay.rd, objPos, axisVec(hitPart - PART_X));
             }
+
+            // Save undo state
+            r.targetId = selId;
+            r.undoPos = objPos;
+            r.undoSiz = objSiz;
+            r.undoQuat = objQuat;
 
             return true;
         }
@@ -175,7 +181,7 @@ bool procSceneInp(InpState inp, vec2 res, int selId, float transMode,
             vec4 objQuat = ld(buf, selId, ROW_ROTATIONS);
             vec3 objSiz = ld(buf, selId, ROW_SIZES).xyz;
 
-            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG;
+            r.flags = r.flags | CHG_SELECTION | CHG_CAMERA | CHG_DRAG | CHG_UNDO;
             r.selId = selId;
             r.imode = MODE_TRANSFORM;
             r.transMode = transMode;
@@ -190,6 +196,12 @@ bool procSceneInp(InpState inp, vec2 res, int selId, float transMode,
             r.dragPlane = objPos;
             r.dragVal = transMode == TRANS_SCALE ? objSiz : objPos;
             r.dragQuat = objQuat;
+
+            // Save undo state
+            r.targetId = selId;
+            r.undoPos = objPos;
+            r.undoSiz = objSiz;
+            r.undoQuat = objQuat;
         } else {
             // Select new object
             r.flags = r.flags | CHG_SELECTION;
@@ -287,17 +299,24 @@ void procCameraMove(InpState inp, vec3 camPos, vec3 camDir, vec2 angles, int sel
 void procKeyboardInp(InpState inp, int selId, float transMode,
                      vec3 camPos, vec3 camDir, sampler2D buf, sampler2D kb, inout IxResult r) {
     vec4 prevKeys = ld(buf, 0, ROW_KEYS);
+    vec4 prevKeys2 = ld(buf, 1, ROW_KEYS);
 
     bool kW = keyDown(kb, KEY_W);
     bool kE = keyDown(kb, KEY_E);
     bool kR = keyDown(kb, KEY_R);
     bool kF = keyDown(kb, KEY_F);
+    bool kZ = keyDown(kb, KEY_Z);
+    bool kC = keyDown(kb, KEY_C);
+    bool kV = keyDown(kb, KEY_V);
 
     // "Just pressed" detection (current frame pressed, previous frame not)
     bool kWJust = kW && prevKeys.x < 0.5;
     bool kEJust = kE && prevKeys.y < 0.5;
     bool kRJust = kR && prevKeys.z < 0.5;
     bool kFJust = kF && prevKeys.w < 0.5;
+    bool kZJust = kZ && prevKeys2.x < 0.5;
+    bool kCJust = kC && prevKeys2.y < 0.5;
+    bool kVJust = kV && prevKeys2.z < 0.5;
 
     // W/E/R: Switch gizmo mode (only when object selected, no modifiers)
     if (selId >= 0 && !inp.kshift && !inp.kalt && !inp.kctrl) {
@@ -337,6 +356,45 @@ void procKeyboardInp(InpState inp, int selId, float transMode,
         r.angles = ld(buf, 1, ROW_CAMERA).xy;
         r.dragAngles = ld(buf, 1, ROW_CAMERA).zw;
         r.dragStart = ld(buf, 0, ROW_CAMERA).xy;
+    }
+
+    // Ctrl+Z: Undo last transform
+    if (inp.kctrl && kZJust) {
+        vec4 undoData = ld(buf, 0, ROW_UNDO);
+        int undoId = int(undoData.x);
+        if (undoId >= 0 && undoId < OBJ_COUNT) {
+            r.flags = r.flags | CHG_UNDO_EXEC | CHG_OBJECT;
+            r.targetId = undoId;
+            r.objPos = ld(buf, 1, ROW_UNDO).xyz;
+            r.objSiz = ld(buf, 2, ROW_UNDO).xyz;
+            r.objQuat = ld(buf, 0, ROW_UNDO_ROT);
+        }
+    }
+
+    // Ctrl+C: Copy selected object's transform to clipboard
+    if (inp.kctrl && kCJust && selId >= 0 && selId < OBJ_COUNT) {
+        r.flags = r.flags | CHG_CLIPBOARD;
+        r.clipPos = ld(buf, selId, ROW_OBJECTS).xyz;
+        r.clipSiz = ld(buf, selId, ROW_SIZES).xyz;
+        r.clipQuat = ld(buf, selId, ROW_ROTATIONS);
+    }
+
+    // Ctrl+V: Paste clipboard transform onto selected object
+    if (inp.kctrl && kVJust && selId >= 0 && selId < OBJ_COUNT) {
+        vec4 clipData = ld(buf, 0, ROW_CLIPBOARD);
+        // Check clipboard is not empty (clipPos stored with valid flag in .w)
+        if (clipData.w > 0.5) {
+            // Save undo before paste
+            r.flags = r.flags | CHG_UNDO | CHG_OBJECT;
+            r.targetId = selId;
+            r.undoPos = ld(buf, selId, ROW_OBJECTS).xyz;
+            r.undoSiz = ld(buf, selId, ROW_SIZES).xyz;
+            r.undoQuat = ld(buf, selId, ROW_ROTATIONS);
+            // Apply clipboard transform
+            r.objPos = clipData.xyz;
+            r.objSiz = ld(buf, 1, ROW_CLIPBOARD).xyz;
+            r.objQuat = ld(buf, 0, ROW_CLIP_ROT);
+        }
     }
 }
 
@@ -437,6 +495,19 @@ vec4 initState(ivec2 px, vec2 res) {
     if (px.y == ROW_DRAG_ROT) {
         return quatId();
     }
+    if (px.y == ROW_UNDO) {
+        if (px.x == 0) return vec4(-1.0, 0.0, 0.0, 0.0); // undoId = -1 (no undo)
+        return vec4(0.0);
+    }
+    if (px.y == ROW_UNDO_ROT) {
+        return quatId();
+    }
+    if (px.y == ROW_CLIPBOARD) {
+        return vec4(0.0); // .w = 0.0 means empty clipboard
+    }
+    if (px.y == ROW_CLIP_ROT) {
+        return quatId();
+    }
     return vec4(0.0);
 }
 
@@ -488,11 +559,22 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf, sampler2D 
                 keyDown(kb, KEY_F) ? 1.0 : 0.0
             );
         }
+        if (px.x == 1) {
+            return vec4(
+                keyDown(kb, KEY_Z) ? 1.0 : 0.0,
+                keyDown(kb, KEY_C) ? 1.0 : 0.0,
+                keyDown(kb, KEY_V) ? 1.0 : 0.0,
+                0.0
+            );
+        }
         return vec4(0.0);
     }
 
     if (px.y == ROW_OBJECTS) {
         if ((r.flags & CHG_OBJECT) != 0u && r.targetId >= 0 && px.x == r.targetId) {
+            return vec4(r.objPos, 0.0);
+        }
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && r.targetId >= 0 && px.x == r.targetId) {
             return vec4(r.objPos, 0.0);
         }
         return ld(buf, px.x, ROW_OBJECTS);
@@ -511,11 +593,17 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf, sampler2D 
         if ((r.flags & CHG_OBJECT) != 0u && r.targetId >= 0 && px.x == r.targetId) {
             return r.objQuat;
         }
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && r.targetId >= 0 && px.x == r.targetId) {
+            return r.objQuat;
+        }
         return ld(buf, px.x, ROW_ROTATIONS);
     }
 
     if (px.y == ROW_SIZES) {
         if ((r.flags & CHG_OBJECT) != 0u && r.targetId >= 0 && px.x == r.targetId) {
+            return vec4(r.objSiz, 0.0);
+        }
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && r.targetId >= 0 && px.x == r.targetId) {
             return vec4(r.objSiz, 0.0);
         }
         return ld(buf, px.x, ROW_SIZES);
@@ -526,6 +614,37 @@ vec4 applyIxResult(ivec2 px, IxResult r, InpState inp, sampler2D buf, sampler2D 
             return r.dragQuat;
         }
         return ld(buf, px.x, ROW_DRAG_ROT);
+    }
+
+    // Undo state storage
+    if (px.y == ROW_UNDO) {
+        if ((r.flags & CHG_UNDO) != 0u) {
+            if (px.x == 0) return vec4(float(r.targetId), 0.0, 0.0, 0.0);
+            if (px.x == 1) return vec4(r.undoPos, 0.0);
+            if (px.x == 2) return vec4(r.undoSiz, 0.0);
+        }
+        // After undo execution, clear undo slot
+        if ((r.flags & CHG_UNDO_EXEC) != 0u && px.x == 0) return vec4(-1.0, 0.0, 0.0, 0.0);
+        return ld(buf, px.x, ROW_UNDO);
+    }
+
+    if (px.y == ROW_UNDO_ROT) {
+        if ((r.flags & CHG_UNDO) != 0u) return r.undoQuat;
+        return ld(buf, px.x, ROW_UNDO_ROT);
+    }
+
+    // Clipboard storage
+    if (px.y == ROW_CLIPBOARD) {
+        if ((r.flags & CHG_CLIPBOARD) != 0u) {
+            if (px.x == 0) return vec4(r.clipPos, 1.0);  // .w = 1.0 means clipboard has data
+            if (px.x == 1) return vec4(r.clipSiz, 0.0);
+        }
+        return ld(buf, px.x, ROW_CLIPBOARD);
+    }
+
+    if (px.y == ROW_CLIP_ROT) {
+        if ((r.flags & CHG_CLIPBOARD) != 0u) return r.clipQuat;
+        return ld(buf, px.x, ROW_CLIP_ROT);
     }
 
     return vec4(0.0);
@@ -540,7 +659,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 res = iResolution.xy;
 
     // 只处理相关行
-    if (px.y > ROW_DRAG_ROT) {
+    if (px.y > ROW_CLIP_ROT) {
         fragColor = vec4(0.0);
         return;
     }
