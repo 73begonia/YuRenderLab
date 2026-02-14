@@ -159,7 +159,7 @@ vec3 getAlbedo(int matId) {
 
 float getRoughness(int matId) {
     float roughness = 0.8;
-    if (matId == MAT_SPHERE) roughness = 0.25;
+    if (matId == MAT_SPHERE) roughness = 0.2;
     if (matId == MAT_TALL)   roughness = 0.6;
     // Clamp to avoid extreme values (0 causes NaN, 1 causes atlas sampling issues)
     return clamp(roughness, 0.05, 0.999);
@@ -226,10 +226,15 @@ vec3 getSHIrradiance(vec3 normal)
 // Get environment colour from equirectangular projection in BufferA
 vec3 getEnvironment(vec3 rayDir, vec2 scaleSize)
 {
-    vec2 texCoord = vec2((atan(rayDir.z, rayDir.x) / TWO_PI) + 0.5, acos(rayDir.y) / PI);
-    texCoord.x = clamp(texCoord.x, 1e-3, 0.999);
-    texCoord *= scaleSize;
-    return texture(iChannel1, texCoord).rgb;
+    vec2 tc = vec2((atan(rayDir.z, rayDir.x) / TWO_PI) + 0.5, acos(rayDir.y) / PI);
+    // Fix filtering artifact at the atan2 wrap-around seam:
+    // GPU screen-space derivatives jump ~1.0 at the ±PI boundary, causing
+    // wrong mipmap LOD selection -> visible seam line. Wrap the derivatives.
+    vec2 dx = dFdx(tc);
+    vec2 dy = dFdy(tc);
+    if (abs(dx.x) > 0.5) dx.x -= sign(dx.x);
+    if (abs(dy.x) > 0.5) dy.x -= sign(dy.x);
+    return textureGrad(iChannel1, tc * scaleSize, dx * scaleSize, dy * scaleSize).rgb;
 }
 
 // Get interpolated prefiltered environment for roughness from BufferB atlas
@@ -250,21 +255,50 @@ vec3 getEnvironment(vec3 rayDir, float roughness, vec2 scaleSize)
     float offset2 = offset1 + 1.0 / pow(2.0, i);
 
     vec2 tc = vec2((atan(rayDir.z, rayDir.x) / TWO_PI) + 0.5, acos(rayDir.y) / PI);
-    vec2 texCoord1 = tc;
-    vec2 texCoord2 = tc;
+    // Fix derivatives at atan2 seam (same technique as background env)
+    vec2 dx = dFdx(tc);
+    vec2 dy = dFdy(tc);
+    if (abs(dx.x) > 0.5) dx.x -= sign(dx.x);
+    if (abs(dy.x) > 0.5) dy.x -= sign(dy.x);
 
     float f = fract(roughness * 5.0);
 
-    texCoord1.x = clamp(texCoord1.x, level1 * 0.005, 1.0 - level1 * 0.005);
-    texCoord2.x = clamp(texCoord2.x, level2 * 0.005, 1.0 - level2 * 0.005);
+    // Tight 1-texel anti-bleed margin (replaces original level*0.005 which
+    // created a visible ~3.6 deg angular gap at the equirectangular seam)
+    float m1 = 1.0 / (iResolution.x * size1);
+    float m2 = 1.0 / (iResolution.x * size2);
 
-    texCoord1 = vec2(offset1, 0.0) + size1 * texCoord1;
-    texCoord2 = vec2(offset2, 0.0) + size2 * texCoord2;
+    vec2 dx1 = dx * size1 * scaleSize, dy1 = dy * size1 * scaleSize;
+    vec2 dx2 = dx * size2 * scaleSize, dy2 = dy * size2 * scaleSize;
 
-    texCoord1 *= scaleSize;
-    texCoord2 *= scaleSize;
+    // Primary samples (clamped to tile interior)
+    vec2 c1 = vec2(clamp(tc.x, m1, 1.0 - m1), tc.y);
+    c1 = (vec2(offset1, 0.0) + size1 * c1) * scaleSize;
+    vec3 col1 = textureGrad(iChannel2, c1, dx1, dy1).rgb;
 
-    return mix(texture(iChannel2, texCoord1).rgb, texture(iChannel2, texCoord2).rgb, f);
+    vec2 c2 = vec2(clamp(tc.x, m2, 1.0 - m2), tc.y);
+    c2 = (vec2(offset2, 0.0) + size2 * c2) * scaleSize;
+    vec3 col2 = textureGrad(iChannel2, c2, dx2, dy2).rgb;
+
+    // Seam fix: near the equirectangular wrap boundary (tc.x ≈ 0 or 1),
+    // also sample from the opposite tile edge (same world direction,
+    // since atan = -π and +π are identical) and crossfade.
+    float edgeDist = min(tc.x, 1.0 - tc.x);
+    float seamW = max(3.0 * m1, 0.005);
+    if (edgeDist < seamW) {
+        float a = smoothstep(0.0, seamW, edgeDist);
+        float wx = 1.0 - tc.x; // opposite-edge coordinate (same direction)
+
+        vec2 w1 = vec2(clamp(wx, m1, 1.0 - m1), tc.y);
+        w1 = (vec2(offset1, 0.0) + size1 * w1) * scaleSize;
+        col1 = mix(textureGrad(iChannel2, w1, dx1, dy1).rgb, col1, a);
+
+        vec2 w2 = vec2(clamp(wx, m2, 1.0 - m2), tc.y);
+        w2 = (vec2(offset2, 0.0) + size2 * w2) * scaleSize;
+        col2 = mix(textureGrad(iChannel2, w2, dx2, dy2).rgb, col2, a);
+    }
+
+    return mix(col1, col2, f);
 }
 
 vec2 getBRDFIntegrationMap(vec2 coord, vec2 scaleSize)
