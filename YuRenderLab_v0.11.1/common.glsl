@@ -1,6 +1,7 @@
 const float PI = 3.1415926535;
 const float TWO_PI = 2.0 * PI;
 const float HALF_PI = 0.5 * PI;
+#define TAU TWO_PI
 
 #define GAMMA 2.2
 #define INV_GAMMA (1.0/GAMMA)
@@ -78,6 +79,9 @@ void pixarONB(vec3 n, out vec3 b1, out vec3 b2)
 #define ROW_KEYS 2
 #define ROW_OBJECTS 3
 #define ROW_DRAG 4
+#define ROW_ROTATIONS 5
+#define ROW_SIZES 6
+#define ROW_DRAG_ROT 7
 
 // ----------------------- Interaction modes -----------------------
 
@@ -151,6 +155,8 @@ InpState gatherInp(sampler2D kb, vec4 mouse, float prevDown) {
 // ----------------------- Transform constants -----------------------
 
 #define TRANS_TRANSLATE 0.0
+#define TRANS_ROTATE 1.0
+#define TRANS_SCALE 2.0
 
 #define PART_NONE -1
 #define PART_CENTER 0
@@ -165,6 +171,8 @@ InpState gatherInp(sampler2D kb, vec4 mouse, float prevDown) {
 #define GZ_CONE_LEN 0.05
 #define GZ_CONE_RAD 0.04
 #define GZ_CENTER_RAD 0.045
+#define GZ_RING_RAD 0.7
+#define GZ_RING_TUBE 0.02
 #define GZ_PICK_RAD 0.08
 #define GZ_MIN_SCALE 0.3
 #define GZ_MAX_SCALE 2.0
@@ -174,6 +182,12 @@ InpState gatherInp(sampler2D kb, vec4 mouse, float prevDown) {
 // ----------------------- Snapping -----------------------
 
 #define TF_SNAP_TRANS 0.25
+#define TF_SNAP_ROT (PI / 12.0)
+#define TF_SNAP_SCALE 0.1
+#define TF_SCALE_MIN 0.1
+#define TF_SCALE_MAX 5.0
+#define TF_ROT_SENS 3.0
+#define TF_SCALE_SENS 2.0
 
 // ----------------------- Gizmo colors -----------------------
 
@@ -208,6 +222,74 @@ struct GizmoHit {
     int part;
 };
 
+// =====================================================================
+// Quaternion Math
+// =====================================================================
+
+vec4 quatId() { return vec4(0.0, 0.0, 0.0, 1.0); }
+
+vec4 quatMul(vec4 a, vec4 b) {
+    return vec4(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    );
+}
+
+vec4 quatAxis(vec3 axis, float angle) {
+    float ha = angle * 0.5;
+    return vec4(axis * sin(ha), cos(ha));
+}
+
+vec3 quatRot(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+vec4 quatConj(vec4 q) {
+    return vec4(-q.xyz, q.w);
+}
+
+mat3 quatToMat(vec4 q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float x2 = x + x, y2 = y + y, z2 = z + z;
+    float xx = x * x2, xy = x * y2, xz = x * z2;
+    float yy = y * y2, yz = y * z2, zz = z * z2;
+    float wx = w * x2, wy = w * y2, wz = w * z2;
+    return mat3(
+        1.0 - (yy + zz), xy + wz, xz - wy,
+        xy - wz, 1.0 - (xx + zz), yz + wx,
+        xz + wy, yz - wx, 1.0 - (xx + yy)
+    );
+}
+
+vec4 matToQuat(mat3 m) {
+    float tr = m[0][0] + m[1][1] + m[2][2];
+    vec4 q;
+    if (tr > 0.0) {
+        float s = sqrt(tr + 1.0) * 2.0;
+        q = vec4((m[1][2] - m[2][1]) / s, (m[2][0] - m[0][2]) / s, (m[0][1] - m[1][0]) / s, 0.25 * s);
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        float s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        q = vec4(0.25 * s, (m[0][1] + m[1][0]) / s, (m[2][0] + m[0][2]) / s, (m[1][2] - m[2][1]) / s);
+    } else if (m[1][1] > m[2][2]) {
+        float s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        q = vec4((m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s, (m[2][0] - m[0][2]) / s);
+    } else {
+        float s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        q = vec4((m[2][0] + m[0][2]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[0][1] - m[1][0]) / s);
+    }
+    return normalize(q);
+}
+
+vec4 applyWorldRot(vec4 q, float rx, float ry, float rz) {
+    vec4 qx = quatAxis(vec3(1.0, 0.0, 0.0), rx);
+    vec4 qy = quatAxis(vec3(0.0, 1.0, 0.0), ry);
+    vec4 qz = quatAxis(vec3(0.0, 0.0, 1.0), rz);
+    return normalize(quatMul(qz, quatMul(qy, quatMul(qx, q))));
+}
+
 // ----------------------- Interaction Result -----------------------
 
 struct IxResult {
@@ -226,6 +308,11 @@ struct IxResult {
     vec3 objPos;
     vec3 dragVal;
     vec3 dragPlane;
+    // Rotation / Scale fields
+    float dragAngle;
+    vec4 dragQuat;
+    vec4 objQuat;
+    vec3 objSiz;
 };
 
 IxResult initIxResult() {
@@ -244,6 +331,10 @@ IxResult initIxResult() {
     r.objPos = vec3(0.0);
     r.dragVal = vec3(0.0);
     r.dragPlane = vec3(0.0);
+    r.dragAngle = 0.0;
+    r.dragQuat = quatId();
+    r.objQuat = quatId();
+    r.objSiz = vec3(1.0);
     return r;
 }
 
@@ -299,6 +390,20 @@ vec3 projectAxis(Ray r, vec3 pp, vec3 axis, vec3 camDir) {
     return rayPlane(r.ro, r.rd, pp, pn);
 }
 
+float calcRotAngle(vec3 ro, vec3 rd, vec3 c, vec3 axis) {
+    vec3 hit = rayPlane(ro, rd, c, axis) - c;
+    if (length(hit) < 0.001) return 0.0;
+    hit = normalize(hit);
+    vec3 up = abs(axis.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 rt = normalize(cross(up, axis));
+    return atan(dot(hit, cross(axis, rt)), dot(hit, rt));
+}
+
+float angleDiff(float cur, float start) {
+    float d = cur - start;
+    return d > PI ? d - TAU : (d < -PI ? d + TAU : d);
+}
+
 // =====================================================================
 // Analytical Intersection (for object selection)
 // =====================================================================
@@ -327,9 +432,53 @@ bool intersectBox(Ray r, vec3 c, vec3 hs, out float t) {
     return true;
 }
 
+bool intersectRotBox(Ray r, vec3 c, vec3 hs, vec4 rot, out float t, out vec3 n) {
+    mat3 m = quatToMat(rot);
+    mat3 inv = transpose(m);
+    vec3 localRo = inv * (r.ro - c);
+    vec3 localRd = inv * r.rd;
+    vec3 inv_rd = 1.0 / localRd;
+    vec3 t1 = (-hs - localRo) * inv_rd;
+    vec3 t2 = ( hs - localRo) * inv_rd;
+    vec3 tmin = min(t1, t2);
+    vec3 tmax = max(t1, t2);
+    float enter = max(max(tmin.x, tmin.y), tmin.z);
+    float texit = min(min(tmax.x, tmax.y), tmax.z);
+    if (enter > texit || texit < 0.0) return false;
+    t = enter > 0.0 ? enter : texit;
+    if (t < 0.001) return false;
+    vec3 lp = localRo + localRd * t;
+    vec3 d = abs(lp) - hs;
+    vec3 localN = d.x > d.y && d.x > d.z ? vec3(sign(lp.x), 0.0, 0.0) :
+                  d.y > d.z ? vec3(0.0, sign(lp.y), 0.0) : vec3(0.0, 0.0, sign(lp.z));
+    n = m * localN;
+    return true;
+}
+
 // =====================================================================
 // Segment Distance (for anti-aliased line rendering)
 // =====================================================================
+
+void getOrthoBasis(vec3 n, out vec3 u, out vec3 v) {
+    if (abs(n.y) < 0.999) {
+        u = normalize(cross(n, vec3(0.0, 1.0, 0.0)));
+    } else {
+        u = normalize(cross(n, vec3(1.0, 0.0, 0.0)));
+    }
+    v = cross(n, u);
+}
+
+void getArcQuad(vec3 cam, vec3 c, int ax, out float sa, out float sb) {
+    vec3 v = normalize(cam - c);
+    vec3 pa, pb;
+    if (ax == 0) { pa = vec3(0.0, 1.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+    else if (ax == 1) { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+    else { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 1.0, 0.0); }
+    sa = sign(dot(v, pa));
+    sb = sign(dot(v, pb));
+    if (sa == 0.0) sa = 1.0;
+    if (sb == 0.0) sb = 1.0;
+}
 
 float lineSegDist(vec3 ro, vec3 rd, vec3 p0, vec3 p1, out float rayT) {
     vec3 v = p1 - p0;
@@ -452,15 +601,58 @@ int pickGizmo(Ray r, vec3 center, float gscale, out float ht) {
     return pickAxisGizmo(r, center, gscale, mat3(1.0), ht);
 }
 
+int pickRotGizmo(Ray r, vec3 c, vec3 cam, float sc, int actPart, out float ht) {
+    int part = PART_NONE;
+    ht = INF;
+    float rr = GZ_RING_RAD * sc;
+    float pr = GZ_PICK_RAD * sc;
+
+    for (int ax = 0; ax < 3; ax++) {
+        vec3 n = axisVec(ax);
+        float d = dot(r.rd, n);
+        if (abs(d) < 0.0001) continue;
+        float pt = dot(c - r.ro, n) / d;
+        if (pt < 0.001) continue;
+        vec3 hp = r.ro + r.rd * pt;
+        float dist = abs(length(hp - c) - rr);
+        if (dist > pr) continue;
+        if (actPart == PART_X + ax) {
+            if (pt < ht) { ht = pt; part = PART_X + ax; }
+            continue;
+        }
+        vec3 th = hp - c;
+        if (length(th) > 0.001) {
+            th = normalize(th);
+            float sa, sb;
+            getArcQuad(cam, c, ax, sa, sb);
+            vec3 pa, pb;
+            if (ax == 0) { pa = vec3(0.0, 1.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+            else if (ax == 1) { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+            else { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 1.0, 0.0); }
+            if (dot(th, pa) * sa > -0.1 && dot(th, pb) * sb > -0.1) {
+                if (pt < ht) { ht = pt; part = PART_X + ax; }
+            }
+        }
+    }
+    return part;
+}
+
+int pickGizmoFull(Ray r, vec3 center, vec3 camPos, float gscale, float transMode, int actPart, vec4 objQuat, out float ht) {
+    if (transMode == TRANS_ROTATE) {
+        return pickRotGizmo(r, center, camPos, gscale, actPart, ht);
+    }
+    mat3 axT = transMode == TRANS_SCALE ? quatToMat(objQuat) : mat3(1.0);
+    return pickAxisGizmo(r, center, gscale, axT, ht);
+}
+
 // =====================================================================
 // Gizmo Rendering (analytical geometry)
 // =====================================================================
 
-GizmoHit traceAxisGizmo(Ray r, vec3 c, int actPart, float sc, float pxScalar) {
+GizmoHit traceAxisGizmo(Ray r, vec3 c, int actPart, float sc, mat3 axT, bool useBox, float pxScalar) {
     GizmoHit g;
     g.t = INF; g.part = PART_NONE; g.alpha = 0.0; g.col = vec3(0.0);
 
-    mat3 axT = mat3(1.0);
     float sz = GZ_SIZE * sc;
     float cr = GZ_CENTER_RAD * sc;
     float cnl = GZ_CONE_LEN * sc;
@@ -482,23 +674,34 @@ GizmoHit traceAxisGizmo(Ray r, vec3 c, int actPart, float sc, float pxScalar) {
         }
     }
 
-    // Axis arrows (cone tips + base disks)
+    // Axis arrows (cone tips or box tips + base disks)
     for (int ax = 0; ax < 3; ax++) {
         vec3 dir = axT * axisVec(ax);
         vec3 col = (actPart == PART_X + ax) ? AXIS_COL_HL : axisCol(ax);
 
-        // Cone tip
-        vec3 apex = c + dir * sz;
-        float coneAng = atan(cnr / cnl);
-        if (hitCone(r.ro, r.rd, apex, -dir, coneAng, cnl, t, n) && t < g.t) {
-            g.t = t; g.part = PART_X + ax; g.alpha = 1.0;
-            g.col = applyShade(col, n);
-        }
-        // Cone base disk
-        vec3 coneBase = c + dir * (sz - cnl);
-        if (hitDisk(r.ro, r.rd, coneBase, -dir, cnr, t) && t < g.t) {
-            g.t = t; g.part = PART_X + ax; g.alpha = 1.0;
-            g.col = applyShade(col, -dir);
+        if (useBox) {
+            // Scale mode: box tips
+            float cs = cnr * 0.7;
+            vec3 cc = c + dir * (sz - cs);
+            float bt; vec3 bn;
+            if (intersectRotBox(r, cc, vec3(cs), matToQuat(axT), bt, bn) && bt < g.t) {
+                g.t = bt; g.part = PART_X + ax; g.alpha = 1.0;
+                g.col = applyShade(col, bn);
+            }
+        } else {
+            // Translate mode: cone tips
+            vec3 apex = c + dir * sz;
+            float coneAng = atan(cnr / cnl);
+            if (hitCone(r.ro, r.rd, apex, -dir, coneAng, cnl, t, n) && t < g.t) {
+                g.t = t; g.part = PART_X + ax; g.alpha = 1.0;
+                g.col = applyShade(col, n);
+            }
+            // Cone base disk
+            vec3 coneBase = c + dir * (sz - cnl);
+            if (hitDisk(r.ro, r.rd, coneBase, -dir, cnr, t) && t < g.t) {
+                g.t = t; g.part = PART_X + ax; g.alpha = 1.0;
+                g.col = applyShade(col, -dir);
+            }
         }
     }
 
@@ -509,7 +712,7 @@ GizmoHit traceAxisGizmo(Ray r, vec3 c, int actPart, float sc, float pxScalar) {
     for (int ax = 0; ax < 3; ax++) {
         vec3 dir = axT * axisVec(ax);
         vec3 pStart = c + dir * cr;
-        vec3 pEnd = c + dir * (sz - cnl);
+        vec3 pEnd = c + dir * (sz - (useBox ? cnr * 1.4 : cnl));
         minGizmoSegment(r.ro, r.rd, pStart, pEnd, PART_X + ax, bestD, bestT, bestPart);
     }
     if (bestT < INF && bestT < g.t) {
@@ -526,7 +729,61 @@ GizmoHit traceAxisGizmo(Ray r, vec3 c, int actPart, float sc, float pxScalar) {
     return g;
 }
 
-GizmoHit traceGizmo(Ray r, vec3 center, vec3 camPos, int actPart, float pxScalar) {
+GizmoHit traceRotGizmo(Ray r, vec3 c, vec3 cam, int actPart, float sc, float pxScalar) {
+    GizmoHit g;
+    g.t = INF; g.part = PART_NONE; g.alpha = 0.0; g.col = vec3(0.0);
+    float rr = GZ_RING_RAD * sc;
+    float th = GZ_RING_TUBE * sc;
+    const int SEGS = 64;
+    float bestD = INF;
+    float bestT = INF;
+    int bestPart = PART_NONE;
+
+    for (int ax = 0; ax < 3; ax++) {
+        vec3 n = axisVec(ax);
+        vec3 u, v;
+        getOrthoBasis(n, u, v);
+        float sa, sb;
+        getArcQuad(cam, c, ax, sa, sb);
+        vec3 pa, pb;
+        if (ax == 0) { pa = vec3(0.0, 1.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+        else if (ax == 1) { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 0.0, 1.0); }
+        else { pa = vec3(1.0, 0.0, 0.0); pb = vec3(0.0, 1.0, 0.0); }
+        vec3 pPrev = c + u * rr;
+        int currentPart = PART_X + ax;
+        bool isAct = (actPart == currentPart);
+        for (int i = 1; i <= SEGS; i++) {
+            float ang = float(i) * TAU / float(SEGS);
+            vec3 pNext = c + (u * cos(ang) + v * sin(ang)) * rr;
+            vec3 midDir = normalize((pPrev + pNext) * 0.5 - c);
+            if (isAct || (dot(midDir, pa) * sa > -0.1 && dot(midDir, pb) * sb > -0.1)) {
+                minGizmoSegment(r.ro, r.rd, pPrev, pNext, currentPart, bestD, bestT, bestPart);
+            }
+            pPrev = pNext;
+        }
+    }
+
+    if (bestT < INF) {
+        float px = bestT * pxScalar;
+        if (bestD < th + px) {
+            g.t = bestT;
+            g.part = bestPart;
+            g.alpha = smoothstep(th + px, th - px, bestD);
+            bool isAct = (actPart == bestPart);
+            vec3 baseCol = isAct ? AXIS_COL_HL : axisCol(bestPart - PART_X);
+            g.col = applyShade(baseCol, -r.rd);
+        }
+    }
+    return g;
+}
+
+GizmoHit traceGizmo(Ray r, vec3 center, vec3 camPos, int actPart, float transMode, vec4 objQuat, float pxScalar) {
     float gsc = gizmoScl(center, camPos);
-    return traceAxisGizmo(r, center, actPart, gsc, pxScalar);
+    if (transMode == TRANS_ROTATE) {
+        return traceRotGizmo(r, center, camPos, actPart, gsc, pxScalar);
+    }
+    return traceAxisGizmo(r, center, actPart, gsc,
+                          transMode == TRANS_SCALE ? quatToMat(objQuat) : mat3(1.0),
+                          transMode == TRANS_SCALE,
+                          pxScalar);
 }

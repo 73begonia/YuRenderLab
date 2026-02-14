@@ -11,6 +11,10 @@
 // Dynamic object positions (set in mainImage, read in sceneSDF)
 vec3 g_spherePos;
 vec3 g_tallboxPos;
+vec4 g_sphereQuat;
+vec4 g_tallboxQuat;
+vec3 g_sphereSize;
+vec3 g_tallboxSize;
 
 // PBR + IBL rendering of a Cornell box scene.
 // No direct lights, no shadows, no normal maps.
@@ -98,18 +102,18 @@ SceneHit sceneSDF(vec3 p)
               vec3(WALL_THICK * 0.5, 2.5 + WALL_THICK, 2.5 + WALL_THICK));
     h = opUnion(h, SceneHit(d, MAT_RIGHT));
 
-    // Sphere (dynamic position from Buffer D)
+    // Sphere (dynamic position and size from Buffer D)
     {
-        d = sdSphere(p - g_spherePos, SPHERE_RADIUS);
+        d = sdSphere(p - g_spherePos, g_sphereSize.x);
         h = opUnion(h, SceneHit(d, MAT_SPHERE));
     }
 
-    // Tall box (dynamic position, fixed rotation)
+    // Tall box (dynamic position, rotation and size from Buffer D)
     {
         vec3 q = p - g_tallboxPos;
-        float c = cos(TALLBOX_ROT_ANGLE), s = sin(TALLBOX_ROT_ANGLE);
-        q.xz = mat2(c, s, -s, c) * q.xz;
-        d = sdBox(q, TALLBOX_HALFSIZE);
+        mat3 rotMat = quatToMat(g_tallboxQuat);
+        q = transpose(rotMat) * q;  // inverse rotation for SDF sampling
+        d = sdBox(q, g_tallboxSize);
         h = opUnion(h, SceneHit(d, MAT_TALL));
     }
 
@@ -155,7 +159,7 @@ vec3 getAlbedo(int matId) {
 
 float getRoughness(int matId) {
     float roughness = 0.8;
-    if (matId == MAT_SPHERE) roughness = 1.0;
+    if (matId == MAT_SPHERE) roughness = 0.25;
     if (matId == MAT_TALL)   roughness = 0.6;
     // Clamp to avoid extreme values (0 causes NaN, 1 causes atlas sampling issues)
     return clamp(roughness, 0.05, 0.999);
@@ -297,6 +301,16 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         g_tallboxPos = TALLBOX_INIT_POS;
     }
 
+    // Load dynamic rotations and sizes (fallback to defaults on first frame)
+    g_sphereQuat = ld(iChannel0, OBJ_SPHERE_ID, ROW_ROTATIONS);
+    g_tallboxQuat = ld(iChannel0, OBJ_TALLBOX_ID, ROW_ROTATIONS);
+    g_sphereSize = ld(iChannel0, OBJ_SPHERE_ID, ROW_SIZES).xyz;
+    g_tallboxSize = ld(iChannel0, OBJ_TALLBOX_ID, ROW_SIZES).xyz;
+    if (length(g_sphereQuat) < 0.001) g_sphereQuat = quatId();
+    if (length(g_tallboxQuat) < 0.001) g_tallboxQuat = quatAxis(vec3(0.0, 1.0, 0.0), -TALLBOX_ROT_ANGLE);
+    if (length(g_sphereSize) < 0.001) g_sphereSize = vec3(SPHERE_RADIUS);
+    if (length(g_tallboxSize) < 0.001) g_tallboxSize = TALLBOX_HALFSIZE;
+
     vec3 rd = rayDirection(CAM_FOV, fragCoord);
     vec3 up = vec3(0.0, 1.0, 0.0);
     mat3 viewMatrix = lookAt(camPos, camPos + camDir, up);
@@ -356,14 +370,17 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     // ---- Gizmo overlay (post-tonemap) ----
     vec4 stateData = ld(iChannel0, 0, ROW_STATE);
     int selId = int(stateData.y);
+    float transMode = stateData.z;
     int actPart = int(stateData.w);
 
     if (selId >= 0 && selId < OBJ_COUNT) {
         vec3 objPos = ld(iChannel0, selId, ROW_OBJECTS).xyz;
+        vec4 objQuat = ld(iChannel0, selId, ROW_ROTATIONS);
+        if (length(objQuat) < 0.001) objQuat = quatId();
         float pxScalar = 1.0 / iResolution.y;
 
         Ray gizmoRay = Ray(camPos, rd);
-        GizmoHit gh = traceGizmo(gizmoRay, objPos, camPos, actPart, pxScalar);
+        GizmoHit gh = traceGizmo(gizmoRay, objPos, camPos, actPart, transMode, objQuat, pxScalar);
 
         if (gh.t < INF) {
             bool occluded = (t < MAX_DIST && t < gh.t);
